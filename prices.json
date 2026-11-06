@@ -1,0 +1,15 @@
+{
+  "taken": "2026-11-06",
+  "source": "https://platform.claude.com/docs/en/about-claude/pricing.md",
+  "unit": "USD per million tokens",
+  "note": "API list prices. On a Claude subscription a run is not billed separately; these prices only give an idea of the size of a run. Refresh with: compaction_eval.py check-pricing",
+  "models": {
+    "claude-opus-5-5": {"input": 4, "cache_write_5m": 5, "cache_write_1h": 8, "cache_read": 0.2, "output": 20},
+    "claude-sonnet-5-5": {"input": 2, "cache_write_5m": 2.5, "cache_write_1h": 4, "cache_read": 0.1, "output": 10},
+    "claude-fable-5-1": {"input": 10, "cache_write_5m": 12.5, "cache_write_1h": 20, "cache_read": 0.25, "output": 50},
+    "claude-haiku-5-5": {"tiers": [
+      {"max_prompt_tokens": 100000, "input": 0.1, "cache_write_5m": 0.125, "cache_write_1h": 0.2, "cache_read": 0.01, "output": 0.5},
+      {"max_prompt_tokens": null, "input": 0.5, "cache_write_5m": 0.625, "cache_write_1h": 1, "cache_read": 0.05, "output": 2.5}
+    ]}
+  }
+}
