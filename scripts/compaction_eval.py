@@ -66,9 +66,13 @@ GENERIC_ATTACHMENTS = {
     "prompt_snapshot", "thinking_drop",
 }
 SCRUBBED = "(removed for the compaction-eval self-test)"
+EVAL_COMMAND = "<command-name>/compaction-eval</command-name>"
+TOOL_CALL_ID = re.compile(r"^(srv)?toolu_\w+$")   # opaque ids that pair a tool call with its result
 GUT_SUMMARY = ("This session is being continued from a previous conversation. "
                "The summary of the earlier part is not available.")
 
+FROM_EVALUATED = ("This is the session being evaluated. Run the eval from a fresh session instead: running it here adds "
+                  "turns to the transcript being measured and reopens its whole context at full price.")
 SUBSCRIPTION_NOTE = ("On a Claude subscription, this run is not billed separately; it counts against "
                      "your plan's usage limits. If usage credits are enabled, usage beyond your limit "
                      "is billed at API rates.")
@@ -208,6 +212,41 @@ def find_transcript(arg_path=None, session=None):
     sys.exit("Give --transcript PATH or --session ID (the `list` command shows candidates).")
 
 
+def eval_start_idx(t, bi, nxt):
+    """Where the session starts evaluating itself, if it does: the /compaction-eval command, or the first eval
+    call, that leads to a call naming this session. What follows is the eval's own work, not the session's, so
+    the turns, the incidents and the saving stop there. Measured 2026-11-08: four scored sessions had run their
+    eval from inside, and the saving had counted those calls (109 calls where 21 were the session's own).
+    A scratchpad path holds the session id of whoever is running, so it does not count as naming the session."""
+    sid = t.path.stem
+    signals, named = [], None
+    for j in range(bi + 1, nxt):
+        r = t.recs[j]
+        if r.get("isSidechain"):
+            continue
+        if r.get("type") == "user" and EVAL_COMMAND in text_of(r):
+            signals.append(j)
+        elif r.get("type") == "assistant":
+            for x in (r.get("message") or {}).get("content") or []:
+                if not (isinstance(x, dict) and x.get("type") == "tool_use"):
+                    continue
+                inp = json.dumps(x.get("input"), ensure_ascii=False)
+                if "compaction_eval.py" not in inp and not (x.get("name") == "Skill" and "compaction-eval" in inp):
+                    continue
+                signals.append(j)
+                bare = re.sub(r"[^\s\"']*/scratchpad[^\s\"']*", "", inp)
+                if named is None and (sid in bare or sid[:8] in bare):
+                    named = j
+    if named is None:
+        return None
+    start = named
+    for j in reversed([s for s in signals if s < named]):
+        if any(is_real_user(t.recs[k]) for k in range(j + 1, start)):
+            break
+        start = j
+    return start
+
+
 def analyze(t, boundary_line=None):
     if not t.boundaries:
         sys.exit("This transcript has no compaction.")
@@ -222,6 +261,7 @@ def analyze(t, boundary_line=None):
     b = t.recs[bi]
     meta = b.get("compactMetadata") or {}
     nxt = next((j for j in t.boundaries if j > bi), len(t.recs))
+    eval_start = eval_start_idx(t, bi, nxt)
     buuid = b["uuid"]
 
     post = None
@@ -256,6 +296,10 @@ def analyze(t, boundary_line=None):
     def first_asst_after(pos):
         return next((k for k in range(pos, len(post)) if t.recs[post[k]].get("type") == "assistant"), None)
 
+    # The probe always stops just before the first reply after the compaction, once Claude Code has put back
+    # what it re-attaches. With no later human turn, stopping on the summary loses all of that (2026-11-08).
+    first_reply = first_asst_after(pos_sum)
+    setup_end = post[first_reply - 1] if first_reply is not None else post[-1]
     turns, splice_start = [], None
     opener = (meta.get("runningTurnSends") or {}).get("openerUuid")
     if opener in t.by and is_real_user(t.recs[t.by[opener]]):
@@ -266,12 +310,13 @@ def analyze(t, boundary_line=None):
         splice_start = fa
     for k in range(pos_sum, len(post)):
         r = t.recs[post[k]]
-        if not is_real_user(r):
+        if not is_real_user(r) or (eval_start is not None and post[k] >= eval_start):
             continue
         fa = first_asst_after(k + 1)
         cutpos = (fa - 1) if fa is not None else len(post) - 1
         if splice_start is None:
-            splice_start = k
+            # Work the agent did before this first message is on the summary side, so the full side needs it too.
+            splice_start = min(k, first_reply) if first_reply is not None else k
         turns.append({"user_idx": post[k], "summary_cut": t.recs[post[cutpos]]["uuid"],
                       "full_cut": t.recs[post[cutpos]]["uuid"], "splice": post[splice_start:cutpos + 1],
                       "reply_pos": fa})
@@ -284,7 +329,8 @@ def analyze(t, boundary_line=None):
     post_assts = [j for j in post if t.recs[j].get("type") == "assistant"]
     first_post_asst = post_assts[0] if post_assts else None
     first_reply_pos = post.index(first_post_asst) if first_post_asst is not None else len(post)
-    incident_msgs = [post[k] for k in range(first_reply_pos + 1, len(post)) if is_real_user(t.recs[post[k]])]
+    incident_msgs = [post[k] for k in range(first_reply_pos + 1, len(post)) if is_real_user(t.recs[post[k]])
+                     and (eval_start is None or post[k] < eval_start)]
 
     ts_boundary = parse_ts(b.get("timestamp"))
     ts_last_pre = parse_ts(last_pre.get("timestamp")) if last_pre else None
@@ -293,6 +339,14 @@ def analyze(t, boundary_line=None):
     gap_h = (ts_boundary - ts_last_pre).total_seconds() / 3600 if ts_boundary and ts_last_pre else None
     idle = bool(meta.get("precomputed") and ts_summary and ts_return and ts_summary < ts_return
                 and gap_h is not None and gap_h > 1)
+    returned = any(ts_summary and parse_ts(t.recs[x["user_idx"]].get("timestamp"))
+                   and parse_ts(t.recs[x["user_idx"]].get("timestamp")) > ts_summary for x in turns)
+    if meta.get("trigger") == "manual":
+        kind = "manual"
+    elif meta.get("precomputed") and gap_h is not None and gap_h > 1:
+        kind = "idle_returned" if returned else "idle_unattended"
+    else:
+        kind = "mid_work"
 
     summary_text = text_of(t.recs[summ]) if summ is not None else ""
     pre, postt = meta.get("preTokens"), meta.get("postTokens")
@@ -328,6 +382,7 @@ def analyze(t, boundary_line=None):
         "bi": bi, "boundary_line": t.lineno[bi], "boundary_uuid": buuid, "summary_idx": summ,
         "summary_text": summary_text, "pre_leaf_uuid": pre_leaf_uuid, "post": post, "turns": turns,
         "incident_msgs": incident_msgs, "reattached": reattached, "kept": kept,
+        "setup_end_idx": setup_end, "eval_start_idx": eval_start,
         "session_attachments": session_atts,
         "facts": {
             "trigger": meta.get("trigger"), "preTokens": pre, "postTokens": postt,
@@ -340,7 +395,8 @@ def analyze(t, boundary_line=None):
             "boundary_at": b.get("timestamp"), "last_activity_before": (last_pre or {}).get("timestamp"),
             "gap_hours": round(gap_h, 2) if gap_h is not None else None,
             "cache_cold": gap_h > 1 if gap_h is not None else None,
-            "idle_signature": idle,
+            "idle_signature": idle, "kind": kind,
+            "eval_started_line": t.lineno[eval_start] if eval_start is not None else None,
             "turns_available": len(turns),
             "summary_chars": len(summary_text),
             "reattached_files": len(reattached),
@@ -623,7 +679,13 @@ def leak_check(cfg, t, a, sum_upto, cut, override, scrubbed_sid, removed, model,
         att = t.recs[j].get("attachment")
         if isinstance(att, dict) and att.get("type") in GENERIC_ATTACHMENTS:
             _scrub_strings(t.recs[j], setup)
-    not_session = (req_null + "\n" + "\n".join(setup)).lower()
+    # A kept `environment` record is setup too: Claude Code rebuilds its "# Environment update" block from the
+    # copy's own session and folder whatever the record holds (2026-11-08), and the copy carries its own session id.
+    for r in a["kept"]:
+        att = t.recs[r["idx"]].get("attachment")
+        if isinstance(att, dict) and att.get("type") == "environment":
+            _scrub_strings(t.recs[r["idx"]], setup)
+    not_session = (req_null + "\n" + "\n".join(setup)).replace(t.path.stem, scrubbed_sid).lower()
     found_raw = [c for c in cans if c in req_raw and c.lower() not in not_session]
     found_sum = [c for c in cans if c in req_sum and c.lower() not in not_session]
     control = (override or "").strip()[:80]
@@ -658,6 +720,8 @@ def canaries(strings):
     characters). Lines survive the rendering Claude Code applies (line-number prefixes, escaping)."""
     out = []
     for s in strings:
+        if TOOL_CALL_ID.match(str(s).strip()):
+            continue
         lines = sorted({ln.strip() for ln in str(s).splitlines() if 8 <= len(ln.strip()) <= 120},
                        key=len, reverse=True)
         for ln in lines[:3]:
@@ -824,6 +888,8 @@ def cost_side(t, a, prices):
     f = a["facts"]
     removed = max((f["context_before_tokens"] or 0) - (f["context_after_tokens"] or 0), 0)
     nxt = next((j for j in t.boundaries if j > a["bi"]), len(t.recs))
+    if a.get("eval_start_idx") is not None:
+        nxt = min(nxt, a["eval_start_idx"])
     calls, order = {}, []
     for j in range(a["bi"] + 1, nxt):
         r = t.recs[j]
@@ -874,13 +940,16 @@ def cost_side(t, a, prices):
             "peak_context_with_tokens": peak, "peak_context_without_tokens": peak + removed if order else None,
             "compaction_own_usd_estimate": own,
             "net_saved_usd": round(extra - own, 4) if own is not None else None,
-            "cache_ttl_seconds": ttl, "unpriced_models": sorted(unpriced), "prices_taken": prices["taken"]}
+            "cache_ttl_seconds": ttl, "unpriced_models": sorted(unpriced), "prices_taken": prices["taken"],
+            "stopped_at_eval_line": f.get("eval_started_line"), "incident_messages_kept": len(a["incident_msgs"])}
 
 
 def cost_lines(c):
     """The saving in plain language, with its limit on the same screen."""
+    stop = ([f"Counted up to line {c['stopped_at_eval_line']}, where this session started evaluating itself: the calls "
+             "after it are the eval's, not the session's."] if c.get("stopped_at_eval_line") else [])
     if not c["calls"]:
-        return ["No call followed this compaction, so there is nothing to compare.", COST_LIMIT]
+        return ["No call followed this compaction, so there is nothing to compare."] + stop + [COST_LIMIT]
     L = [f"Without this compaction, the {c['calls']} API call(s) that followed it would have cost about "
          f"${c['actual_plus_extra_usd']:.2f} instead of ${c['actual_usd']:.2f}: about "
          f"${c['extra_usd_without_compaction']:.2f} more. The compaction removed {c['history_removed_tokens']:,} tokens "
@@ -895,6 +964,7 @@ def cost_lines(c):
                  f"transcript does not record that call), so the net saving is about ${c['net_saved_usd']:.2f}.")
     if c["unpriced_models"]:
         L.append(f"Left out, no price in the table: {', '.join(c['unpriced_models'])}.")
+    L += stop
     L.append(COST_LIMIT)
     return L
 
@@ -1104,11 +1174,13 @@ def print_plan(path, t, a, prices, est, est_probe, est_reuse, est_reuse_probe, c
     print(f"Transcript: {path}")
     print(f"  read {t.prefix_lines} lines, md5 of what was read {t.prefix_md5}")
     print(f"Compaction at line {a['boundary_line']} ({len(t.boundaries)} in this transcript)")
-    for k in ("trigger", "preTokens", "postTokens", "compression_ratio", "precomputed", "idle_signature",
+    for k in ("kind", "trigger", "preTokens", "postTokens", "compression_ratio", "precomputed", "idle_signature",
               "gap_hours", "cache_cold", "context_before_tokens", "context_after_tokens",
               "session_model", "session_effort", "claude_code_version", "turns_available", "summary_chars",
               "reattached_files", "reattached_chars", "kept_messages", "kept_reply_chars", "session_attachments"):
         print(f"  {k}: {f[k]}")
+    if os.environ.get("CLAUDE_CODE_SESSION_ID") == path.stem:
+        print(f"  ! {FROM_EVALUATED}")
     if f["kept_reply_chars"] > cfg["kept_reply_warn_chars"]:
         print(f"  ! Claude Code kept the agent's last reply word for word after the summary "
               f"({f['kept_reply_chars']} characters). If it is a recap, a real score credits what it carries "
@@ -1178,9 +1250,8 @@ def cmd_plant(args, cfg):
 
 def self_test_scope(t, a):
     """The summary side's cut for the probe, and the records a self-test scrubs up to it."""
-    cuts = [t.by[x["summary_cut"]] for x in a["turns"][:1]]
-    sum_upto = max(cuts + [a["summary_idx"] or 0])
-    cut = a["turns"][0]["summary_cut"] if a["turns"] else t.recs[sum_upto]["uuid"]
+    sum_upto = max(a["setup_end_idx"], a["summary_idx"] or 0)
+    cut = t.recs[sum_upto]["uuid"]
     to_scrub = sorted({r["idx"] for r in a["kept"]} |
                       {r["idx"] for r in a["session_attachments"] if r["idx"] <= sum_upto})
     return sum_upto, cut, to_scrub
@@ -1345,6 +1416,7 @@ def cmd_history(args, cfg):
         passes = fair_passes([x for _, x in xs], bar, sid, bl)
         print(f"\n{session_label(sid)} line {bl}: "
               + (f"fair self-test passed ({len(passes)})" if passes else "NO fair self-test has passed"))
+        print(f"  kind: {KIND_NAMES[kind_of(xs[-1][1])]}")
         kept = next((x for _, x in reversed(xs) if "kept_reply_chars" in x), None)
         if kept:
             print(f"  kept messages {kept['kept_messages']}, the agent's kept reply "
@@ -1418,6 +1490,19 @@ OVERVIEW_WORD_LIMIT = 900        # at five compactions; each further one adds a 
 OVERVIEW_CRITICAL_SHOWN = 8      # the rest stay in each run's report.md
 
 
+KIND_NAMES = {"idle_returned": "Idle, and you came back", "idle_unattended": "Idle, and nobody came back",
+              "mid_work": "Mid-work, the session had grown too large", "manual": "Manual", "unknown": "Not recorded"}
+
+
+def kind_of(x):
+    """A log line's kind of compaction. Lines written before 2026-11-08 have no `kind`: only what they recorded is used."""
+    if x.get("kind"):
+        return x["kind"]
+    if x.get("trigger") == "manual":
+        return "manual"
+    return "idle_returned" if x.get("idle_signature") else "unknown"
+
+
 def plain_name(session_id):
     name = session_name(session_id)
     if not name:
@@ -1459,17 +1544,16 @@ def overview_rows(lines, cfg):
 
 
 def overview_cost(row, prices):
-    """The saving for one row: from the log when the run recorded it, else from the transcript, else None."""
-    if row["x"].get("cost_side"):
-        return row["x"]["cost_side"]
+    """The saving for one row: recomputed from the transcript, so a correction to the method reaches lines already
+    logged (they counted the eval's own calls until 2026-11-08); from the log only when the transcript is gone."""
     hits = sorted(PROJECTS.glob(f"*/{row['sid']}.jsonl"))
-    if not hits:
-        return None
     try:
-        t = Transcript(hits[0])
-        return cost_side(t, analyze(t, row["line"]), prices)
+        if hits:
+            t = Transcript(hits[0])
+            return cost_side(t, analyze(t, row["line"]), prices)
     except (SystemExit, OSError, ValueError, KeyError):
-        return None
+        pass
+    return row["x"].get("cost_side")
 
 
 def build_overview(lines, cfg):
@@ -1496,7 +1580,7 @@ def build_overview(lines, cfg):
     priced = [r for r in rows if r["cost"] and r["cost"].get("calls") and r["cost"].get("net_saved_usd") is not None]
     net = sum(r["cost"]["net_saved_usd"] for r in priced)
     n = len(rows)
-    idle = [r for r in rows if r["x"].get("idle_signature")]
+    idle = [r for r in rows if kind_of(r["x"]) in ("idle_returned", "idle_unattended")]
 
     head = (f"**Across {n} compaction{'s' if n != 1 else ''}, the agent kept {tot['kept']} of the {tot['items']} things "
             f"that mattered, blurred {tot['distorted']} and lost {tot['lost']}, and the compactions saved about "
@@ -1523,6 +1607,17 @@ def build_overview(lines, cfg):
                      if have and c.get("net_saved_usd") is not None else "not available | not available |"))
     L += ["", "*Score* counts important items more. *Critical* means forgetting it causes a wrong action. *Net saved* is the "
           "extra cost of the later calls with the full history, minus an estimate of what writing the summary cost.", ""]
+
+    by_kind = {}
+    for r in rows:
+        by_kind.setdefault(kind_of(r["x"]), []).append(r)
+    if len(by_kind) > 1:
+        L += ["## By kind of compaction", "", "| Kind | Compactions | Kept | Score | Critical |", "|---|---|---|---|---|"]
+        for k, rs in by_kind.items():
+            scores = [r["x"].get("retention_pct") or 0 for r in rs]
+            L.append(f"| {KIND_NAMES[k]} | {len(rs)} | {sum(r['tot']['kept'] for r in rs)} of {sum(r['tot']['items'] for r in rs)} | "
+                     f"{min(scores):g}% to {max(scores):g}% | {sum(r['x'].get('critical_losses') or 0 for r in rs)} |")
+        L += ["", "Too few compactions per kind to call this a difference between kinds until there are about five of each.", ""]
 
     kinds = {}
     for r in rows:
@@ -1568,9 +1663,12 @@ def build_overview(lines, cfg):
             replays.append((x["divergence_mean"], x["noise_floor"]))
         try:
             run_json = json.loads((Path(x["run_dir"]) / "run.json").read_text())
-            if run_json.get("incidents"):
-                incidents["n"] += run_json["incidents"]["incidents"]
-                incidents["of"] += run_json["incidents"]["messages"]
+            inc = run_json.get("incidents")
+            if inc:
+                # Messages after the session started evaluating itself are the eval's, so they do not count.
+                keep = min(inc["messages"], (r["cost"] or {}).get("incident_messages_kept", inc["messages"]))
+                incidents["n"] += sum(1 for f in inc.get("flags", [])[:keep] if f.get("incident") in ("restate", "correct"))
+                incidents["of"] += keep
         except (OSError, ValueError, KeyError):
             pass
     L += ["## How the agent behaved afterwards", ""]
@@ -1603,7 +1701,7 @@ def build_overview(lines, cfg):
         L += [f"**`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`** (the size from which idle compaction runs). All {len(idle)} idle "
               f"compactions were at {min(r['x'].get('preTokens') or 0 for r in idle):,} tokens or more, so this says nothing "
               "about smaller sessions.", ""]
-    size = [r for r in rows if not r["x"].get("idle_signature") and r["x"].get("trigger") == "auto"]
+    size = [r for r in rows if kind_of(r["x"]) == "mid_work"]
     if size:
         pts = [r["x"].get("preTokens") or 0 for r in size]
         L += [f"**`autoCompactWindow`** (how large a session grows before compacting for size). {len(size)} of the {n} compacted "
@@ -1683,6 +1781,8 @@ def cmd_check_pricing(args, cfg):
 def cmd_run(args, cfg):
     path = find_transcript(args.transcript, args.session)
     t = Transcript(path)
+    if os.environ.get("CLAUDE_CODE_SESSION_ID") == path.stem and not args.from_evaluated_session:
+        sys.exit(f"Nothing was run. {FROM_EVALUATED} --from-evaluated-session runs anyway.")
     a = analyze(t, args.boundary_line)
     f = a["facts"]
     gate = summary_gate(a["summary_text"])
@@ -1751,7 +1851,7 @@ def cmd_run(args, cfg):
         if not args.reuse or n_turns:
             full_sid, p, _, _ = make_copy(cfg, t, a["bi"] - 1, splice=splice, reparent_to=a["pre_leaf_uuid"])
             run["copies"].append(p)
-        cuts = [t.by[x["summary_cut"]] for x in (need or a["turns"][:1])]
+        cuts = [t.by[x["summary_cut"]] for x in need] + [a["setup_end_idx"]]
         sum_upto = max(cuts + [a["summary_idx"] or 0])
         # Self-test: every route by which the session's own content reaches the summary side is scrubbed,
         # not only the summary: the kept messages, and every non-generic attachment up to the cut.
@@ -1767,7 +1867,7 @@ def cmd_run(args, cfg):
                      "where scrub_record looks, so the format may have changed and the self-test would not "
                      "be a fair control. Fix scrub_record first.")
         write_json(run_dir / "run.json", run)
-        sum_cut1 = a["turns"][0]["summary_cut"] if a["turns"] else t.recs[sum_upto]["uuid"]
+        sum_cut1 = t.recs[a["setup_end_idx"]]["uuid"]
 
         # The free leak check, before anything is spent. Claude Code builds the summary-side request three
         # times and a local catcher keeps it: from a copy that is NOT scrubbed (the positive control: the
@@ -1926,7 +2026,8 @@ def cmd_run(args, cfg):
 
     log_line = {
         "date": run["started"][:10], "label": label, "session_id": path.stem, "boundary_line": a["boundary_line"],
-        "trigger": f["trigger"], "idle_signature": f["idle_signature"], "cache_cold": f["cache_cold"],
+        "trigger": f["trigger"], "kind": f["kind"], "eval_started_line": f["eval_started_line"],
+        "idle_signature": f["idle_signature"], "cache_cold": f["cache_cold"],
         "preTokens": f["preTokens"], "postTokens": f["postTokens"], "compression_ratio": f["compression_ratio"],
         "context_before_tokens": f["context_before_tokens"], "context_after_tokens": f["context_after_tokens"],
         "session_model": f["session_model"], "session_effort": f["session_effort"],
@@ -2073,6 +2174,8 @@ def main():
     p.add_argument("--keep-copies", action="store_true")
     p.add_argument("--force", action="store_true", help="run even if the summary gate fails")
     p.add_argument("--reuse-incidents-skip", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--from-evaluated-session", action="store_true",
+                   help="run even though this is the session being evaluated (adds turns to the transcript it measures)")
     p.add_argument("--unvalidated", action="store_true",
                    help="real run without a fair self-test on this compaction; the log and report mark it")
     p.add_argument("--keep-reattached", action="store_true",

@@ -7,7 +7,9 @@ description: Score how well a Claude Code compaction kept what mattered, on the 
 
 Scores one compaction of a Claude Code session on disk. Fresh headless agents answer questions and replay the next turns twice: once from what the compacted agent really had (summary plus preserved messages) and once from the full history before the compaction. A judge on a different model compares the answers. The result is a per-session report and one line in a longitudinal log.
 
-You, the agent running this skill, only dispatch and relay. Never score from your own memory of the session, even when you are the session that was compacted: you are the side being measured.
+You, the agent running this skill, only dispatch and relay. Never score from your own memory of the session: you are the side being measured.
+
+Run the eval from a fresh session, not from the session being evaluated. Run from inside, it adds turns to the transcript it measures and reopens the whole context at full price. If the user asks from the session they want scored, say so and give them the session id to paste into a fresh one; `run` refuses until then (`--from-evaluated-session` overrides it, when the user insists). Several compactions can be run from one fresh session: each is a script, not a conversation, and its results land in the results folder.
 
 The script is `scripts/compaction_eval.py` in this skill's folder (standard library Python 3). Read `references/method.md` when the user asks how the scoring works or what a number means.
 
@@ -16,7 +18,7 @@ The script is `scripts/compaction_eval.py` in this skill's folder (standard libr
 1. **Find the compaction.** If the user gave a session id or a transcript path, use it. Otherwise run `python3 <skill>/scripts/compaction_eval.py list` and ask which session. A session can hold several compactions; `plan` takes the latest unless `--boundary-line N` names another (`plan` prints the line numbers).
 
 2. **Plan, which spends nothing.** Run `plan --session <id>` (plus `--boundary-line` if needed). Relay to the user, in plain words:
-   - what the compaction was: trigger, tokens before and after, whether it looks like an idle compaction (`idle_signature`), the turns available after it;
+   - what the compaction was: its `kind` (`idle_returned`: compacted during a break and the user came back; `idle_unattended`: compacted during a break and nobody came back; `mid_work`: compacted because the session grew too large while the agent worked; `manual`), trigger, tokens before and after, the turns available after it;
    - the warning, when `plan` prints one, that Claude Code kept the agent's last reply word for word: when that reply is a recap, a real score credits what it carries to the compaction, not to the summary alone;
    - the summary gate result (if it failed, the "summary" is not a summary, and scoring it would measure the wrong thing: say so and stop unless the user insists, then pass `--force`);
    - the two cost estimates and the price of a run that reuses a self-test's questions, with the date of the price table, and the subscription sentence exactly as printed. If the table is flagged stale, offer `check-pricing` first;
@@ -45,7 +47,8 @@ When the user asks how compaction has gone overall, or what to make of the compa
 - **The transcript is never written.** The script reads it and writes temporary copies under `~/.claude/projects/<work folder>/`, deleted at the end of the run. If anything else would need to write to a transcript, stop and ask.
 - **A live session's transcript keeps growing.** The run records the md5 and line count of what it read; do not report that a transcript "changed" without comparing that prefix.
 - **Two numbers are never averaged together.** Retention (what the agent could answer) and divergence (what it would do) answer different questions.
-- **Compare like with like.** When reading the log, group by trigger, idle signature and context size before comparing; say when a comparison mixes groups.
+- **Compare like with like.** When reading the log, group by `kind` and context size before comparing; say when a comparison mixes groups.
+- **What a session did to evaluate itself is not the session.** The turns, the incident count and the saving stop where a session starts evaluating itself (`eval_started_line`). Log lines written before 2026-11-08 keep the old figures; `tradeoff` and `overview` recompute the saving from the transcript.
 - **Read past results through `history`, not the raw log.** It groups the runs by compaction (by session name where one exists) and says, for each, whether a fair self-test vouches for it, how long the kept reply was, and which report carries a wrong cost figure. The log lines stay as they were written.
 - **The log's `settings` field is the settings file when the eval ran, not the compaction's.** Claude Code writes no settings snapshot into the transcript. `at_compaction` holds what the transcript does prove (trigger, model, effort, version, an idle compaction's notice, a lower bound on the window). Say which of the two you are quoting.
 - **Numbers are shareable, notes are not.** The report, the note and the overview quote the user's session. Do not paste them anywhere public without the user's say.
