@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """compaction-eval: score how well a Claude Code compaction kept what mattered.
 
-Commands: list, plan, run, plant, check-pricing.
+Commands: list, plan, run, leak-check, self-test-status, history, tradeoff, overview, plant, check-pricing.
 
 Standard library only. The transcript is read, never written: answering agents
 run as headless `claude -p` resumes of temporary copies placed in a dedicated
@@ -43,7 +43,31 @@ DEFAULTS = {
     "counterfactual_auto_below_usd": None,   # None = always ask; a number = run without asking below it
     "price_max_age_days": 90,
     "call_timeout_s": 1800,
+    # Self-test verdict. Retention counts only items the no-context agent missed, so the no-context
+    # side scores 0 by construction; a fair self-test (every route scrubbed) should land near it.
+    # Measured 2026-11-07: four fair self-tests 0.0%; five with routes left open 25.0 to 71.9%.
+    # 10 fails all five and leaves room for a stray item or two. Recalibrate as runs accumulate.
+    "self_test_max_retention_pct": 10,
+    "self_test_min_items": 10,               # fewer scored items: the verdict is not trusted
+    "kept_reply_warn_chars": 1000,           # plan warns when the reply kept after the summary is longer
+    "replay_short_chars": 40,                # plan warns when the replay is one message at most this long
+    "capture_timeout_s": 180,                # the free request capture of the self-test's leak check
 }
+
+# Attachment types Claude Code adds after a compaction that describe the setup (instructions, tool and
+# skill listings, environment), not the session. Every other attachment after the boundary carries the
+# session's own content (a re-attached file, a note naming a file read before, the skills invoked with
+# their arguments, a file edited on disk), so the self-test scrubs it. An unknown type is scrubbed too:
+# a new attachment type is more likely to leak than to be needed.
+GENERIC_ATTACHMENTS = {
+    "instructions", "session_context", "date", "deferred_tools_delta", "deferred_tools_record",
+    "agent_listing_delta", "skill_listing", "mcp_instructions_delta", "environment", "model",
+    "hook_success", "hook_additional_context", "credential_org", "remote_session_change",
+    "prompt_snapshot", "thinking_drop",
+}
+SCRUBBED = "(removed for the compaction-eval self-test)"
+GUT_SUMMARY = ("This session is being continued from a previous conversation. "
+               "The summary of the earlier part is not available.")
 
 SUBSCRIPTION_NOTE = ("On a Claude subscription, this run is not billed separately; it counts against "
                      "your plan's usage limits. If usage credits are enabled, usage beyond your limit "
@@ -272,10 +296,39 @@ def analyze(t, boundary_line=None):
 
     summary_text = text_of(t.recs[summ]) if summ is not None else ""
     pre, postt = meta.get("preTokens"), meta.get("postTokens")
+
+    # Files Claude Code re-attaches after the compaction (recently read or written files). The
+    # compacted agent really has them, so a real run keeps them; a self-test blanks them, because a
+    # session that wrote its own handoff files carries most of its facts there, not in the summary
+    # (measured 2026-11-07: a gutted summary still scored 71.9% on a session with 3 such files).
+    reattached, session_atts = [], []
+    for j in range(bi + 1, nxt):
+        att = t.recs[j].get("attachment")
+        if t.recs[j].get("type") != "attachment" or not isinstance(att, dict):
+            continue
+        if att.get("type") == "file":
+            body = ((att.get("content") or {}).get("file") or {}).get("content")
+            reattached.append({"idx": j, "line": t.lineno[j], "file": att.get("filename"),
+                               "chars": len(body) if isinstance(body, str) else None})
+        if att.get("type") not in GENERIC_ATTACHMENTS:
+            session_atts.append({"idx": j, "line": t.lineno[j], "type": att.get("type")})
+
+    # Messages Claude Code keeps word for word after the summary. They sit BEFORE the boundary in the
+    # file and are re-linked after the summary when the session loads (compactMetadata.preservedMessages),
+    # so following the records after the boundary never shows them. Measured 2026-11-07 on four
+    # compactions: each kept the agent's last reply (1,505 to 5,842 characters, a closing recap three
+    # times) and the user's answer to it, and a gutted summary still scored 41 to 51% from them.
+    pm = meta.get("preservedMessages") or {}
+    pu = list(dict.fromkeys((pm.get("allUuids") or []) + (pm.get("uuids") or [])))
+    preserved = sorted(t.by[u] for u in pu if u in t.by)
+    kept = [{"idx": j, "line": t.lineno[j], "type": t.recs[j].get("type"), "chars": len(text_of(t.recs[j]))}
+            for j in preserved if t.recs[j].get("type") in ("user", "assistant", "attachment")]
+    kept_reply_chars = sum(k["chars"] for k in kept if k["type"] == "assistant")
     return {
         "bi": bi, "boundary_line": t.lineno[bi], "boundary_uuid": buuid, "summary_idx": summ,
         "summary_text": summary_text, "pre_leaf_uuid": pre_leaf_uuid, "post": post, "turns": turns,
-        "incident_msgs": incident_msgs,
+        "incident_msgs": incident_msgs, "reattached": reattached, "kept": kept,
+        "session_attachments": session_atts,
         "facts": {
             "trigger": meta.get("trigger"), "preTokens": pre, "postTokens": postt,
             "compression_ratio": round(pre / postt, 2) if pre and postt else None,
@@ -290,6 +343,12 @@ def analyze(t, boundary_line=None):
             "idle_signature": idle,
             "turns_available": len(turns),
             "summary_chars": len(summary_text),
+            "reattached_files": len(reattached),
+            "reattached_chars": sum(r["chars"] or 0 for r in reattached),
+            "kept_messages": len(kept),
+            "kept_reply_chars": kept_reply_chars,
+            "session_attachments": sum(1 for s in session_atts
+                                       if first_post_asst is None or s["idx"] < first_post_asst),
         },
     }
 
@@ -302,8 +361,12 @@ def summary_gate(text):
     return {"passed": ok, "chars": len(text), "section_markers_found": len(markers)}
 
 
+IDLE_NOTICE = "written while you were away"   # Claude Code's own message after an idle compaction
+
+
 def settings_in_force():
-    out = {"read_at": now_iso(), "note": "read when the eval ran, not when the compaction ran"}
+    out = {"read_at": now_iso(),
+           "note": "read from ~/.claude/settings.json when the eval ran, not when the compaction ran; see at_compaction"}
     p = Path.home() / ".claude" / "settings.json"
     try:
         s = json.loads(p.read_text())
@@ -328,6 +391,36 @@ def settings_in_force():
     return out
 
 
+def at_compaction(t, a):
+    """What this compaction's own transcript proves about the settings at that moment. Claude Code writes
+    no settings snapshot into the transcript, so this holds only facts and bounds read from the records,
+    never a value taken from a settings file. A window size cannot be read at all: a session that reached
+    N tokens without compacting for size only shows that its window was at least N."""
+    f = a["facts"]
+    nxt = next((j for j in t.boundaries if j > a["bi"]), len(t.recs))
+    notice = any(r.get("type") == "system" and r.get("subtype") == "informational"
+                 and IDLE_NOTICE in str(r.get("content")) for r in t.recs[a["bi"] + 1:nxt])
+    peak = max((ctx_tokens(r) for r in t.recs[:a["bi"]] if r.get("type") == "assistant"
+                and not r.get("isSidechain")), default=0)
+    idle = notice or f["idle_signature"]
+    out = {"source": "this compaction's transcript records; nothing here comes from a settings file",
+           "trigger": f["trigger"], "model": f["session_model"], "effort": f["session_effort"],
+           "claude_code_version": f["claude_code_version"],
+           "idle_compaction": ("on, recorded in the transcript" if notice
+                               else "on, by its signature (no notice found)" if idle else "not shown")}
+    if idle:
+        out["auto_compact_window_at_least"] = peak   # it had not compacted for size at this context
+        out["idle_min_tokens_at_most"] = f["preTokens"]
+    elif f["trigger"] == "auto":
+        out["auto_compact_window_about"] = f["preTokens"]   # compacted for size near this context
+    settings = Path.home() / ".claude" / "settings.json"
+    ts = parse_ts(f["boundary_at"])
+    if settings.exists() and ts:
+        changed = dt.datetime.fromtimestamp(settings.stat().st_mtime, dt.timezone.utc) > ts
+        out["settings_file_modified_after_compaction"] = changed
+    return out
+
+
 # ---------------------------------------------------------------- copies and calls
 
 def work_project_dir(cfg):
@@ -338,28 +431,239 @@ def work_project_dir(cfg):
     return wd, proj
 
 
-def make_copy(cfg, t, upto_idx, splice=(), reparent_to=None, summary_idx=None, override=None):
-    """Write records 0..upto_idx (+ spliced records) as a new session file. Never touches the source."""
+def _scrub_strings(o, removed, keep_keys=("type",)):
+    """Replace every string leaf (except the values of `keep_keys`) with SCRUBBED; collect originals."""
+    if isinstance(o, dict):
+        return {k: (v if k in keep_keys else _scrub_strings(v, removed, keep_keys)) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_scrub_strings(v, removed, keep_keys) for v in o]
+    if isinstance(o, str) and o.strip() and o != SCRUBBED:
+        removed.append(o)
+        return SCRUBBED
+    return o
+
+
+def scrub_record(d):
+    """Remove the session's own content from one record, in place (self-test only). Returns the original
+    strings removed. An attachment loses every string in `attachment` and in `rendered` (the text the
+    model reads), file names included: a file name alone answered an item exactly (2026-11-07). A kept
+    message loses its text, thinking, tool inputs and tool results."""
+    removed = []
+    if d.get("type") == "attachment":
+        d["attachment"] = _scrub_strings(d.get("attachment") or {}, removed)
+        if isinstance(d.get("rendered"), list):
+            for r in d["rendered"]:
+                if isinstance(r, dict) and isinstance(r.get("content"), str):
+                    removed.append(r["content"])
+                    r["content"] = f"<system-reminder>\n{SCRUBBED}\n</system-reminder>"
+        return removed
+    m = d.get("message") or {}
+    c = m.get("content")
+    if isinstance(c, str):
+        removed.append(c)
+        m["content"] = SCRUBBED
+    for x in c if isinstance(c, list) else []:
+        if not isinstance(x, dict):
+            continue
+        ty = x.get("type")
+        if ty == "text":
+            removed.append(x.get("text", ""))
+            x["text"] = SCRUBBED
+        elif ty == "tool_use":
+            removed.append(json.dumps(x.get("input"), ensure_ascii=False))
+            x["input"] = {}
+        elif ty == "tool_result":
+            cc = x.get("content")
+            removed.append(cc if isinstance(cc, str) else json.dumps(cc, ensure_ascii=False))
+            x["content"] = SCRUBBED
+        elif ty in ("image", "thinking", "redacted_thinking"):
+            # A thinking block's text is empty in the transcript, but its signature is sent and carries the
+            # thinking itself (seen in a captured request, 2026-11-07). Turn it into placeholder text.
+            removed.append(x.get("signature") or x.get("data") or ty)
+            x.clear()
+            x.update({"type": "text", "text": SCRUBBED})
+    if "toolUseResult" in d:
+        d["toolUseResult"] = _scrub_strings(d["toolUseResult"], removed)
+    return [s for s in removed if s and s.strip()]
+
+
+def make_copy(cfg, t, upto_idx, splice=(), reparent_to=None, summary_idx=None, override=None, scrub=()):
+    """Write records 0..upto_idx (+ spliced records) as a new session file. Never touches the source.
+    `scrub`: indices of records whose session content is removed (self-test only, see scrub_record).
+    `cost-state` records are always left out: Claude Code restores the session's running cost from the
+    last one on resume and adds it to every call's total_cost_usd (measured 2026-11-07: $32.70 added
+    to each of three calls, so a $10.47 run reported $108.56).
+    In a self-test copy (`scrub` given), the original session id is also replaced everywhere by the
+    copy's: Claude Code stores it in the environment block (the scratchpad path), where it answered an
+    item asking for the session's id prefix (2026-11-07).
+    Returns (session id, path, number of records scrubbed, original strings removed)."""
     _, proj = work_project_dir(cfg)
     sid = str(uuid.uuid4())
     dest = proj / f"{sid}.jsonl"
+    scrub, n_scrubbed, removed = set(scrub), 0, []
+    orig = t.path.stem.encode()
     with open(dest, "x") as f:
         for i in range(upto_idx + 1):
-            d = json.loads(t.raw[i])
+            d = json.loads(t.raw[i].replace(orig, sid.encode()) if scrub else t.raw[i])
+            if d.get("type") == "cost-state":
+                continue
             if "sessionId" in d:
                 d["sessionId"] = sid
             if override is not None and i == summary_idx:
                 d["message"]["content"] = override
+            if i in scrub:
+                got = scrub_record(d)
+                if got:
+                    n_scrubbed += 1
+                    removed += got
             f.write(json.dumps(d, ensure_ascii=False) + "\n")
         for n, i in enumerate(splice):
             d = json.loads(t.raw[i])
+            if d.get("type") == "cost-state":
+                continue
             if "sessionId" in d:
                 d["sessionId"] = sid
             if n == 0 and reparent_to:
                 d["parentUuid"] = reparent_to
                 d.pop("logicalParentUuid", None)
             f.write(json.dumps(d, ensure_ascii=False) + "\n")
-    return sid, str(dest)
+    return sid, str(dest), n_scrubbed, removed
+
+
+# ---------------------------------------------------------------- the free leak check
+
+def capture_request(cfg, model, session=None, cut=None):
+    """Have Claude Code build the request it would send for this copy, and catch it locally instead of
+    sending it: `claude -p` runs with ANTHROPIC_BASE_URL pointing at a catcher on 127.0.0.1 that keeps
+    the body and answers 400. Nothing reaches the API, so this costs nothing. Request headers are never
+    read or kept. Returns the text of the request's messages (all string values, joined), or None."""
+    import http.server
+    import threading
+    bodies = []
+
+    class Catcher(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            n = int(self.headers.get("content-length") or 0)
+            body = self.rfile.read(n)
+            if "/messages" in self.path:
+                bodies.append(body)
+            msg = b'{"type":"error","error":{"type":"invalid_request_error","message":"captured"}}'
+            self.send_response(400)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Catcher)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    wd, _ = work_project_dir(cfg)
+    cmd = [cfg["claude_bin"], "-p"]
+    if session:
+        cmd += ["--resume", session]
+    if cut:
+        cmd += ["--resume-session-at", cut]
+    cmd += CLAUDE_FLAGS + ["--model", model, "(compaction-eval leak check)"]
+    env = dict(os.environ, ANTHROPIC_BASE_URL=f"http://127.0.0.1:{srv.server_address[1]}")
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, cwd=str(wd), env=env,
+                       stdin=subprocess.DEVNULL, timeout=cfg["capture_timeout_s"])
+    except subprocess.TimeoutExpired:
+        pass
+    finally:
+        srv.shutdown()
+    for body in reversed(bodies):
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if d.get("messages"):
+            out = []
+
+            def walk(o):
+                if isinstance(o, dict):
+                    for v in o.values():
+                        walk(v)
+                elif isinstance(o, list):
+                    for v in o:
+                        walk(v)
+                elif isinstance(o, str):
+                    out.append(o)
+            walk(d["messages"])
+            return "\n".join(out)
+    return None
+
+
+def leak_check(cfg, t, a, sum_upto, cut, override, scrubbed_sid, removed, model, copies):
+    """The self-test's free leak check. Claude Code builds the summary-side request three times and a
+    local catcher keeps it: from a copy that is NOT scrubbed (the control: the removed text must be found
+    there), from the scrubbed copy (it must be gone), and with no session (text the setup itself carries,
+    which is not a leak). Appends the extra copy's path to `copies` so the caller deletes it.
+    Returns (check, scrubbed request text, no-session request text)."""
+    print("Leak check (free: the requests are caught locally, nothing is sent)")
+    cans = canaries(removed)
+    raw_sid, raw_p, _, _ = make_copy(cfg, t, sum_upto, summary_idx=a["summary_idx"], override=override)
+    copies.append(raw_p)
+    req_raw = capture_request(cfg, model, session=raw_sid, cut=cut)
+    req_sum = capture_request(cfg, model, session=scrubbed_sid, cut=cut)
+    req_null = capture_request(cfg, model)
+    if not (req_raw and req_sum and req_null):
+        return ({"verdict": "Claude Code did not build one of the requests, so the self-test cannot show it "
+                            "is a fair control"}, req_sum, req_null)
+    # Text that is not the session's: what a request with no session carries, and what the setup records
+    # after the boundary carry (the skill listing, the instructions), which the self-test keeps.
+    setup = []
+    for j in range(a["bi"] + 1, sum_upto + 1):
+        att = t.recs[j].get("attachment")
+        if isinstance(att, dict) and att.get("type") in GENERIC_ATTACHMENTS:
+            _scrub_strings(t.recs[j], setup)
+    not_session = (req_null + "\n" + "\n".join(setup)).lower()
+    found_raw = [c for c in cans if c in req_raw and c.lower() not in not_session]
+    found_sum = [c for c in cans if c in req_sum and c.lower() not in not_session]
+    control = (override or "").strip()[:80]
+    check = {"canaries": len(cans), "found_unscrubbed": len(found_raw), "found_scrubbed": len(found_sum),
+             "leaks": found_sum[:20], "planted_summary_seen": bool(control) and control in req_sum and control in req_raw,
+             "request_chars": {"unscrubbed": len(req_raw), "scrubbed": len(req_sum), "none": len(req_null)}}
+    print(f"  {len(cans)} distinctive lines removed; found in the unscrubbed request: {len(found_raw)}; "
+          f"in the scrubbed request: {len(found_sum)}")
+    if not check["planted_summary_seen"] or (cans and not found_raw):
+        check["verdict"] = ("the control failed (the planted summary or the removed text was not found where "
+                            "it must be), so the check proves nothing")
+    elif found_sum:
+        check["verdict"] = "session content still reaches the summary side: " + " | ".join(found_sum[:5])
+    else:
+        check["verdict"] = "clean"
+    return check, req_sum, req_null
+
+
+def answers_reachable(items, req_sum, req_null):
+    """Items whose literal answer (a path, an id, a number) is in the scrubbed request and not in the
+    no-session one: a route the scrub does not cover."""
+    home = str(Path.home())
+    s_low = req_sum.replace(home, "~").lower()
+    n_low = req_null.replace(home, "~").lower()
+    return [it["id"] for it in items if literals(it["answer"]) and
+            all(x.lower() in s_low for x in literals(it["answer"])) and
+            not all(x.lower() in n_low for x in literals(it["answer"]))]
+
+
+def canaries(strings):
+    """Distinctive lines of the removed strings: for each, up to 3 of its longest lines (8 to 120
+    characters). Lines survive the rendering Claude Code applies (line-number prefixes, escaping)."""
+    out = []
+    for s in strings:
+        lines = sorted({ln.strip() for ln in str(s).splitlines() if 8 <= len(ln.strip()) <= 120},
+                       key=len, reverse=True)
+        for ln in lines[:3]:
+            if ln not in out and SCRUBBED not in ln:
+                out.append(ln)
+    return out
 
 
 def claude_version(cfg):
@@ -498,6 +802,101 @@ def estimate(cfg, a, prices, counterfactual=True, turns=None, noise=None, reuse=
             "prices_taken": prices["taken"], "prices_source": prices["source"],
             "prices_age_days": price_age_days(prices),
             "prices_stale": price_age_days(prices) > cfg["price_max_age_days"]}
+
+
+COST_LIMIT = ("This is an estimate, not a bill. It takes the calls that really followed the compaction and adds "
+              "back the history the compaction removed, at API list prices. A session that had kept its full history "
+              "might have gone differently, and would have reached its auto-compact limit and compacted anyway. On a "
+              "Claude subscription nothing is billed per call: read it as how much more of your usage limits the same "
+              "work would have used.")
+
+
+def cost_side(t, a, prices):
+    """What the compaction saved, from the token counts the transcript records per API call. Method: take every
+    call of the main conversation after the compaction, up to the next compaction or the end of the session,
+    once each (a call streamed over several records is one call; a subagent's call is untouched by the compaction).
+    Without the compaction, each would have carried the removed history too: read from the prompt cache at the
+    cache-read price, or written again at the cache-write price when the gap since the previous call exceeds the
+    cache's lifetime. The transcript does not record the call that wrote the summary, so its cost is estimated:
+    one cached read of the history, plus the summary's length (4 characters a token) as output. On the one
+    compaction where a running-cost record brackets it (2026-11-08, Substack Reader), the unexplained remainder
+    was $0.29 for an estimate of $0.23: it ran on the cache, not a cold rewrite."""
+    f = a["facts"]
+    removed = max((f["context_before_tokens"] or 0) - (f["context_after_tokens"] or 0), 0)
+    nxt = next((j for j in t.boundaries if j > a["bi"]), len(t.recs))
+    calls, order = {}, []
+    for j in range(a["bi"] + 1, nxt):
+        r = t.recs[j]
+        m = r.get("message") or {}
+        if r.get("type") != "assistant" or r.get("isSidechain") or not m.get("usage") or m.get("model") == "<synthetic>":
+            continue
+        key = m.get("id") or r.get("uuid")
+        if key not in calls:
+            order.append(key)
+        calls[key] = r
+    ttl_1h = any(((calls[k]["message"]["usage"].get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0) > 0
+                 for k in order)
+    ttl = 3600 if ttl_1h else 300
+    write_key = "cache_write_1h" if ttl_1h else "cache_write_5m"
+    prev = parse_ts(f["last_activity_before"])
+    actual = extra = 0.0
+    cold, peak, unpriced, first = 0, 0, set(), None
+    for k in order:
+        r = calls[k]
+        m = r["message"]
+        ts = parse_ts(r["timestamp"])
+        ctx = ctx_tokens(r)
+        peak = max(peak, ctx)
+        c = price_usage(prices, m["model"], m["usage"])
+        rates = rates_for(prices, m["model"], ctx + removed)
+        if c is None or rates is None:
+            unpriced.add(m["model"])
+            prev = ts
+            continue
+        is_cold = prev is not None and ts is not None and (ts - prev).total_seconds() > ttl
+        cold += is_cold
+        add = removed * (rates[write_key] if is_cold else rates["cache_read"]) / 1e6
+        if first is None:
+            first = {"with": c, "without": c + add,
+                     "gap_h": round((ts - prev).total_seconds() / 3600, 2) if prev and ts else None}
+        actual += c
+        extra += add
+        prev = ts
+    rates = rates_for(prices, f["session_model"], f["context_before_tokens"] or 0) if f["session_model"] else None
+    own = (round(((f["context_before_tokens"] or 0) * rates["cache_read"]
+                  + (f["summary_chars"] or 0) / 4 * rates["output"]) / 1e6, 4) if rates else None)
+    return {"calls": len(order), "cold_calls": cold, "history_removed_tokens": removed,
+            "actual_usd": round(actual, 4), "extra_usd_without_compaction": round(extra, 4),
+            "actual_plus_extra_usd": round(actual + extra, 4),
+            "first_reply_usd_with": round(first["with"], 4) if first else None,
+            "first_reply_usd_without": round(first["without"], 4) if first else None,
+            "first_reply_gap_hours": first["gap_h"] if first else None,
+            "peak_context_with_tokens": peak, "peak_context_without_tokens": peak + removed if order else None,
+            "compaction_own_usd_estimate": own,
+            "net_saved_usd": round(extra - own, 4) if own is not None else None,
+            "cache_ttl_seconds": ttl, "unpriced_models": sorted(unpriced), "prices_taken": prices["taken"]}
+
+
+def cost_lines(c):
+    """The saving in plain language, with its limit on the same screen."""
+    if not c["calls"]:
+        return ["No call followed this compaction, so there is nothing to compare.", COST_LIMIT]
+    L = [f"Without this compaction, the {c['calls']} API call(s) that followed it would have cost about "
+         f"${c['actual_plus_extra_usd']:.2f} instead of ${c['actual_usd']:.2f}: about "
+         f"${c['extra_usd_without_compaction']:.2f} more. The compaction removed {c['history_removed_tokens']:,} tokens "
+         f"of history from every one of them, and {c['cold_calls']} came after a break long enough for that history "
+         "to have left the cache.",
+         f"First reply after it ({c['first_reply_gap_hours']} hours after the last message): about "
+         f"${c['first_reply_usd_with']:.2f} with the compaction, about ${c['first_reply_usd_without']:.2f} without.",
+         f"Largest context these calls reached: {c['peak_context_with_tokens']:,} tokens, against about "
+         f"{c['peak_context_without_tokens']:,} without the compaction."]
+    if c["compaction_own_usd_estimate"] is not None:
+        L.append(f"Producing the summary itself cost about ${c['compaction_own_usd_estimate']:.2f} (estimated, the "
+                 f"transcript does not record that call), so the net saving is about ${c['net_saved_usd']:.2f}.")
+    if c["unpriced_models"]:
+        L.append(f"Left out, no price in the table: {', '.join(c['unpriced_models'])}.")
+    L.append(COST_LIMIT)
+    return L
 
 
 def judge_model(cfg, session_model):
@@ -693,10 +1092,12 @@ def plan_data(args, cfg):
     prices = load_prices()
     est = estimate(cfg, a, prices, counterfactual=True, turns=args.turns, noise=args.noise)
     est_probe = estimate(cfg, a, prices, counterfactual=False)
-    return path, t, a, prices, est, est_probe
+    est_reuse = estimate(cfg, a, prices, counterfactual=True, turns=args.turns, noise=args.noise, reuse=True)
+    est_reuse_probe = estimate(cfg, a, prices, counterfactual=False, reuse=True)
+    return path, t, a, prices, est, est_probe, est_reuse, est_reuse_probe
 
 
-def print_plan(path, t, a, est, est_probe, cfg, args):
+def print_plan(path, t, a, prices, est, est_probe, est_reuse, est_reuse_probe, cfg, args):
     f = a["facts"]
     gate = summary_gate(a["summary_text"])
     n_turns = min(args.turns or cfg["turns"], f["turns_available"])
@@ -705,14 +1106,31 @@ def print_plan(path, t, a, est, est_probe, cfg, args):
     print(f"Compaction at line {a['boundary_line']} ({len(t.boundaries)} in this transcript)")
     for k in ("trigger", "preTokens", "postTokens", "compression_ratio", "precomputed", "idle_signature",
               "gap_hours", "cache_cold", "context_before_tokens", "context_after_tokens",
-              "session_model", "session_effort", "claude_code_version", "turns_available", "summary_chars"):
+              "session_model", "session_effort", "claude_code_version", "turns_available", "summary_chars",
+              "reattached_files", "reattached_chars", "kept_messages", "kept_reply_chars", "session_attachments"):
         print(f"  {k}: {f[k]}")
+    if f["kept_reply_chars"] > cfg["kept_reply_warn_chars"]:
+        print(f"  ! Claude Code kept the agent's last reply word for word after the summary "
+              f"({f['kept_reply_chars']} characters). If it is a recap, a real score credits what it carries "
+              "to the compaction, not to the summary alone.")
     print(f"Summary gate: {'passed' if gate['passed'] else 'FAILED'} "
           f"({gate['chars']} characters, {gate['section_markers_found']} section markers)")
     print(f"Counterfactual window: {n_turns} turn(s) of {f['turns_available']} available")
+    if n_turns == 1 and a["turns"] and len(a["turns"][0]["text"].strip()) <= cfg["replay_short_chars"]:
+        msg = a["turns"][0]["text"].strip()
+        print(f"  ! The replay has only one short message ({len(msg)} characters: \"{msg}\"). It adds about "
+              f"${round(est['total_usd'] - est_probe['total_usd'], 2)} to the probe alone and shows little about "
+              "what the agent would do differently.")
+    k = at_compaction(t, a)
+    print("Known from the transcript about this compaction (nothing else records the settings at that moment):")
+    for key, value in k.items():
+        if key != "source":
+            print(f"  {key}: {value}")
     print(f"Estimate at API prices taken {est['prices_taken']} ({est['prices_source']}):")
     print(f"  probe only: ${est_probe['total_usd']}")
     print(f"  probe + counterfactual: ${est['total_usd']}")
+    print(f"  reusing a self-test's questions (--reuse): probe only ${est_reuse_probe['total_usd']}, "
+          f"probe + counterfactual ${est_reuse['total_usd']}")
     if est["prices_stale"]:
         print(f"  ! the price table is {est['prices_age_days']} days old: run check-pricing")
     if est["models_without_verified_price"]:
@@ -720,20 +1138,25 @@ def print_plan(path, t, a, est, est_probe, cfg, args):
               "those calls are left out of the estimate")
     print("  Upper bound: the context sizes include tool definitions the replay leaves out.")
     print(f"  {SUBSCRIPTION_NOTE}")
+    print("What the compaction saved (free, from the transcript):")
+    for line in cost_lines(cost_side(t, a, prices)):
+        print(f"  {line}")
 
 
 def cmd_plan(args, cfg):
-    path, t, a, prices, est, est_probe = plan_data(args, cfg)
+    path, t, a, prices, est, est_probe, est_reuse, est_reuse_probe = plan_data(args, cfg)
     if args.json:
         out = {"transcript": str(path), "lines_read": t.prefix_lines, "md5_read": t.prefix_md5,
                "boundary_line": a["boundary_line"], "facts": a["facts"],
                "summary_gate": summary_gate(a["summary_text"]),
                "turns": [{"n": x["n"], "line": x["line"], "text": x["text"][:200]} for x in a["turns"]],
                "estimate_probe_only": est_probe, "estimate_with_counterfactual": est,
-               "subscription_note": SUBSCRIPTION_NOTE}
+               "estimate_reuse_probe_only": est_reuse_probe, "estimate_reuse_with_counterfactual": est_reuse,
+               "at_compaction": at_compaction(t, a), "cost_side": cost_side(t, a, prices),
+               "cost_limit": COST_LIMIT, "subscription_note": SUBSCRIPTION_NOTE}
         print(json.dumps(out, indent=2, ensure_ascii=False))
     else:
-        print_plan(path, t, a, est, est_probe, cfg, args)
+        print_plan(path, t, a, prices, est, est_probe, est_reuse, est_reuse_probe, cfg, args)
 
 
 def cmd_plant(args, cfg):
@@ -741,8 +1164,7 @@ def cmd_plant(args, cfg):
     a = analyze(Transcript(path), args.boundary_line)
     text = a["summary_text"]
     if args.mode == "gut":
-        planted = ("This session is being continued from a previous conversation. "
-                   "The summary of the earlier part is not available.")
+        planted = GUT_SUMMARY
     else:
         if not args.drop:
             sys.exit("--mode drop needs at least one --drop PATTERN")
@@ -752,6 +1174,490 @@ def cmd_plant(args, cfg):
         planted = "\n".join(kept)
     Path(args.out).write_text(planted)
     print(f"Planted summary written to {args.out} ({len(planted)} characters, original {len(text)}).")
+
+
+def self_test_scope(t, a):
+    """The summary side's cut for the probe, and the records a self-test scrubs up to it."""
+    cuts = [t.by[x["summary_cut"]] for x in a["turns"][:1]]
+    sum_upto = max(cuts + [a["summary_idx"] or 0])
+    cut = a["turns"][0]["summary_cut"] if a["turns"] else t.recs[sum_upto]["uuid"]
+    to_scrub = sorted({r["idx"] for r in a["kept"]} |
+                      {r["idx"] for r in a["session_attachments"] if r["idx"] <= sum_upto})
+    return sum_upto, cut, to_scrub
+
+
+def cmd_leak_check(args, cfg):
+    """The self-test's leak check alone, free: is a gutted self-test a fair control on this compaction?"""
+    path = find_transcript(args.transcript, args.session)
+    t = Transcript(path)
+    a = analyze(t, args.boundary_line)
+    override = Path(args.summary_override).read_text() if args.summary_override else GUT_SUMMARY
+    model = args.answer_model or a["facts"]["session_model"]
+    sum_upto, cut, to_scrub = self_test_scope(t, a)
+    copies, check, n = [], {"verdict": "not run"}, -1
+    try:
+        sid, p, n, removed = make_copy(cfg, t, sum_upto, summary_idx=a["summary_idx"], override=override,
+                                       scrub=to_scrub)
+        copies.append(p)
+        print(f"Compaction at line {a['boundary_line']}: {len(to_scrub)} records to scrub, {n} scrubbed:")
+        for i in to_scrub:
+            r = t.recs[i]
+            print(f"  line {t.lineno[i]}: {r.get('type')} {(r.get('attachment') or {}).get('type') or ''}")
+        check, req_sum, req_null = leak_check(cfg, t, a, sum_upto, cut, override, sid, removed, model, copies)
+        if args.items and req_sum and req_null:
+            items = json.loads(Path(args.items).read_text())
+            check["answers_reachable"] = answers_reachable(items, req_sum, req_null)
+            print(f"  item answers still in the scrubbed request: {', '.join(check['answers_reachable']) or 'none'}")
+    finally:
+        for p in copies:
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+    print(f"Verdict: {check['verdict']}")
+    if args.json:
+        print(json.dumps(check, indent=2, ensure_ascii=False))
+    sys.exit(0 if check["verdict"] == "clean" and n == len(to_scrub)
+             and not check.get("answers_reachable") else 1)
+
+
+def load_log(cfg, results_dir=None):
+    log = Path(results_dir or cfg["results_dir"]).expanduser() / "log.jsonl"
+    lines = [json.loads(x) for x in log.read_text().splitlines() if x.strip()] if log.exists() else []
+    return log, lines
+
+
+def is_self_test(x):
+    # The first self-test (2026-11-06) was logged as "planted-gut"; later ones as "planted".
+    return str(x.get("label", "")).startswith("planted")
+
+
+def self_test_reading(x, bar):
+    """Whether one self-test's log line counts as a fair pass today, and if not, why."""
+    v = x.get("self_test_passed")
+    if v is None:
+        return "no verdict (older run, does not count)"
+    if v is False:
+        return "failed"
+    # `kept_messages` entered the log with the all-routes scrub and its leak check (2026-11-07):
+    # a pass logged before it left the kept reply and other routes open, so it proves nothing.
+    if "kept_messages" not in x:
+        return "passed before every route was scrubbed (does not count)"
+    r = x.get("retention_pct")
+    if r is None or r > bar:
+        return f"passed under an older bar, above today's {bar}% (does not count)"
+    return "passed"
+
+
+def fair_passes(lines, bar, session_id, boundary_line):
+    """Fair self-test passes on one compaction. A pass counts only for the compaction it ran on: whether
+    the scrub closes every route depends on that session (its kept reply, re-attached files, skills)."""
+    return [x for x in lines if is_self_test(x) and x.get("session_id") == session_id
+            and x.get("boundary_line") == boundary_line and self_test_reading(x, bar) == "passed"]
+
+
+def cmd_self_test_status(args, cfg):
+    """Exit 0 when a self-test passed fairly on the compaction named (session, boundary line): every
+    route scrubbed, retention at or below the current bar. 1 otherwise, and 1 when no compaction is
+    named: a pass on one compaction says nothing about another."""
+    log, lines = load_log(cfg, args.results_dir)
+    bar = cfg["self_test_max_retention_pct"]
+    tests = [x for x in lines if is_self_test(x)]
+    if not (args.session or args.transcript):
+        print(f"{len(tests)} self-test run(s) in {log}. A self-test counts only for the compaction it ran on: "
+              "name one with --session (and --boundary-line).")
+        for x in tests:
+            print(f"  {x.get('date')} {x.get('session_id', '')[:8]} L{x.get('boundary_line')}: retention "
+                  f"{x.get('retention_pct')}%, {self_test_reading(x, bar)}")
+        sys.exit(1)
+    path = find_transcript(args.transcript, args.session)
+    a = analyze(Transcript(path), args.boundary_line)
+    sid, bl = path.stem, a["boundary_line"]
+    mine = [x for x in tests if x.get("session_id") == sid and x.get("boundary_line") == bl]
+    passed = fair_passes(lines, bar, sid, bl)
+    print(f"Compaction {sid[:8]} line {bl}: {len(mine)} self-test run(s) in {log}; "
+          f"{len(passed)} count as a fair pass.")
+    for x in mine:
+        print(f"  {x.get('date')}: retention {x.get('retention_pct')}%, {self_test_reading(x, bar)} "
+              f"({Path(x.get('run_dir', '')).name})")
+    if passed:
+        print(f"Real runs on this compaction can reuse its questions: --reuse {passed[-1].get('run_dir')}")
+    sys.exit(0 if passed else 1)
+
+
+def run_root(run_dir):
+    """The run whose questions a run used: follow --reuse back to the run that extracted them."""
+    seen, d = set(), str(run_dir or "")
+    while d and d not in seen:
+        seen.add(d)
+        try:
+            nxt = json.loads((Path(d) / "run.json").read_text()).get("reuse")
+        except (OSError, ValueError):
+            return Path(d).name
+        if not nxt:
+            return Path(d).name
+        d = str(nxt)
+    return Path(d).name
+
+
+def session_name(session_id):
+    """The session's title (Claude Code's `custom-title` records), or None: not every session has one."""
+    hits = sorted(PROJECTS.glob(f"*/{session_id}.jsonl"))
+    if not hits:
+        return None
+    for line in reversed(hits[0].read_bytes().split(b"\n")):
+        if b'"custom-title"' in line:
+            try:
+                title = json.loads(line).get("customTitle")
+            except json.JSONDecodeError:
+                continue
+            if title:
+                return str(title)
+    return None
+
+
+def session_label(session_id):
+    name = session_name(session_id)
+    return f"{name} [{session_id[:8]}]" if name else session_id[:8]
+
+
+def real_reading(x, passes):
+    """How a real score reads today: validated on the same questions, on other questions, or not at all."""
+    roots = {run_root(p.get("run_dir")) for p in passes}
+    if not passes:
+        return "real score, NOT validated: no fair self-test on this compaction"
+    if run_root(x.get("run_dir")) in roots:
+        return "real score, validated by a fair self-test on the same questions"
+    return ("real score, the compaction passed a fair self-test but on other questions; "
+            "a self-test with --reuse of this run checks these")
+
+
+def cmd_history(args, cfg):
+    """Every logged run, grouped by compaction, with what each result can and cannot be trusted for today.
+    The log lines are left as written; this reading is recomputed from them and the run folders."""
+    log, lines = load_log(cfg, args.results_dir)
+    bar = cfg["self_test_max_retention_pct"]
+    groups = {}
+    for n, x in enumerate(lines, 1):
+        groups.setdefault((x.get("session_id", ""), x.get("boundary_line")), []).append((n, x))
+    print(f"{len(lines)} run(s) in {log}, on {len(groups)} compaction(s).")
+    for (sid, bl), xs in groups.items():
+        passes = fair_passes([x for _, x in xs], bar, sid, bl)
+        print(f"\n{session_label(sid)} line {bl}: "
+              + (f"fair self-test passed ({len(passes)})" if passes else "NO fair self-test has passed"))
+        kept = next((x for _, x in reversed(xs) if "kept_reply_chars" in x), None)
+        if kept:
+            print(f"  kept messages {kept['kept_messages']}, the agent's kept reply "
+                  f"{kept['kept_reply_chars']} characters, re-attached files {kept.get('reattached_files')}")
+        else:
+            print("  kept reply not recorded for this compaction: `plan` shows it, for free")
+        for n, x in xs:
+            head = (f"  log line {n}, {x.get('date')}, {x.get('label')}: {x.get('retention_pct')}% of "
+                    f"{x.get('items_scored')} items")
+            if is_self_test(x):
+                reading = "self-test, " + self_test_reading(x, bar)
+            else:
+                reading = real_reading(x, passes)
+            notes = []
+            try:
+                cost = json.loads((Path(x.get("run_dir", "")) / "run.json").read_text()).get("cost") or {}
+                cc, tb = cost.get("actual_usd_claude_code"), cost.get("actual_usd_table")
+                if cc and tb and abs(cc - tb) > max(0.05, 0.02 * tb):
+                    notes.append(f"its report's Claude Code cost figure ${cc} is wrong; the price-table "
+                                 f"figure ${tb} is right")
+            except (OSError, ValueError):
+                notes.append("run folder not found")
+            if not is_self_test(x) and x.get("divergence_mean") is not None:
+                notes.append(f"replay divergence {x.get('divergence_mean')}, noise {x.get('noise_floor')}")
+            print(f"{head}: {reading}" + ("".join(f"; {m}" for m in notes)) + ".")
+
+
+def cmd_tradeoff(args, cfg):
+    """One compaction, both sides: what it lost (the logged real score) and what it saved (the transcript's token
+    counts). Spends nothing."""
+    path = find_transcript(args.transcript, args.session)
+    t = Transcript(path)
+    a = analyze(t, args.boundary_line)
+    _, lines = load_log(cfg, args.results_dir)
+    bar = cfg["self_test_max_retention_pct"]
+    bl = a["boundary_line"]
+    passes = fair_passes(lines, bar, path.stem, bl)
+    print(f"{session_label(path.stem)}, compaction at line {bl} ({a['facts']['boundary_at']})")
+    real = [x for x in lines if not is_self_test(x) and x.get("session_id") == path.stem and x.get("boundary_line") == bl]
+    print("\nWhat it gave up:")
+    if not real:
+        print("  No real score is logged for this compaction, so the loss side is empty. `plan` prices one.")
+    else:
+        x = real[-1]
+        cats = x.get("by_category") or {}
+        total = {k: sum(c.get(k, 0) for c in cats.values()) for k in ("items", "kept", "distorted", "lost")}
+        print(f"  Weighted retention {x.get('retention_pct')}% of {x.get('items_scored')} scored items "
+              f"({real_reading(x, passes)}). Critical losses: {x.get('critical_losses')}.")
+        print(f"  Kept {total['kept']}, distorted {total['distorted']}, lost {total['lost']} of {total['items']}.")
+        for cat, c in sorted(cats.items()):
+            print(f"    {cat}: {c['kept']} kept of {c['items']}")
+        try:
+            rows = json.loads((Path(x["run_dir"]) / "probe_scores.json").read_text())["items"]
+            for r in rows:
+                if r["status"] == "scored" and r["severity"] == 2 and r["summary"] != "kept":
+                    print(f"  Critical, {r['summary']}: {r['question']}")
+        except (OSError, ValueError, KeyError):
+            print("  (the run folder with the items is not available)")
+        print("  This counts everything the agent had after the compaction: the summary, and the messages and "
+              "files Claude Code kept beside it. It does not measure the summary alone.")
+    print("\nWhat it saved:")
+    for line in cost_lines(cost_side(t, a, load_prices())):
+        print(f"  {line}")
+
+
+NUM_WORDS = ["None", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve"]
+ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
+KIND_LABELS = {"ruling": "Rulings", "decision": "Decisions", "id_path": "Exact ids and paths",
+               "constraint": "Constraints", "open_task": "Open tasks", "fact": "Facts"}
+OVERVIEW_WORD_LIMIT = 900        # at five compactions; each further one adds a table row
+OVERVIEW_CRITICAL_SHOWN = 8      # the rest stay in each run's report.md
+
+
+def plain_name(session_id):
+    name = session_name(session_id)
+    if not name:
+        return session_id[:8]
+    # A session title's leading status mark and its " — subtitle" are dropped: the table needs a short name.
+    return re.sub(r"^[^\w\[(]+", "", name).split(" — ")[0].strip()
+
+
+def overview_rows(lines, cfg):
+    """Which runs an overview may count: for each compaction, the latest real score a fair self-test vouches
+    for on the same questions. Anything else is left out and named, because an unvalidated score could not be
+    told from an empty summary. Returns (rows in log order, [(compaction label, why left out)])."""
+    bar = cfg["self_test_max_retention_pct"]
+    groups = {}
+    for n, x in enumerate(lines, 1):
+        groups.setdefault((x.get("session_id", ""), x.get("boundary_line")), []).append((n, x))
+    rows, left_out = [], []
+    for (sid, bl), xs in groups.items():
+        passes = fair_passes([x for _, x in xs], bar, sid, bl)
+        roots = {run_root(p.get("run_dir")) for p in passes}
+        reals = [(n, x) for n, x in xs if not is_self_test(x)]
+        good = [(n, x) for n, x in reals if run_root(x.get("run_dir")) in roots]
+        if good:
+            rows.append({"n": good[-1][0], "x": good[-1][1], "sid": sid, "line": bl})
+        else:
+            left_out.append((f"{plain_name(sid)}, line {bl} [{sid[:8]}]",
+                             "its real score is not validated by a fair self-test on the same questions" if reals
+                             else "no real score yet"))
+    rows.sort(key=lambda r: r["n"])
+    per_session = {}
+    for r in rows:
+        per_session.setdefault(r["sid"], []).append(r)
+    for r in rows:
+        same = per_session[r["sid"]]
+        r["name"] = plain_name(r["sid"])
+        if len(same) > 1:
+            r["name"] += f", {ORDINALS[same.index(r)] if same.index(r) < len(ORDINALS) else 'later'} compaction"
+    return rows, left_out
+
+
+def overview_cost(row, prices):
+    """The saving for one row: from the log when the run recorded it, else from the transcript, else None."""
+    if row["x"].get("cost_side"):
+        return row["x"]["cost_side"]
+    hits = sorted(PROJECTS.glob(f"*/{row['sid']}.jsonl"))
+    if not hits:
+        return None
+    try:
+        t = Transcript(hits[0])
+        return cost_side(t, analyze(t, row["line"]), prices)
+    except (SystemExit, OSError, ValueError, KeyError):
+        return None
+
+
+def build_overview(lines, cfg):
+    """A plain-language report across every logged compaction, in the shape Maxime approved on 2026-11-08
+    (trials/2026-11_compaction-evals/overview-draft-2026-11-08.md): conclusion first, session names, what
+    each kind of thing kept, what it means per setting, and what the data cannot support."""
+    rows, left_out = overview_rows(lines, cfg)
+    if not rows:
+        L = ["# What your compactions gave up and what they saved", "",
+             "No compaction has a validated real score yet, so there is nothing to report across compactions. "
+             "A score counts here once a fair self-test has passed on the same questions."]
+        if left_out:
+            L += ["", "Left out:"] + [f"- {name}: {why}." for name, why in left_out]
+        return "\n".join(L) + "\n"
+
+    prices = load_prices()
+    for r in rows:
+        r["cost"] = overview_cost(r, prices)
+        r["cats"] = r["x"].get("by_category") or {}
+        r["tot"] = {k: sum(c.get(k, 0) for c in r["cats"].values()) for k in ("items", "kept", "distorted", "lost")}
+    tot = {k: sum(r["tot"][k] for r in rows) for k in ("items", "kept", "distorted", "lost")}
+    missing = tot["distorted"] + tot["lost"]
+    critical = sum(r["x"].get("critical_losses") or 0 for r in rows)
+    priced = [r for r in rows if r["cost"] and r["cost"].get("calls") and r["cost"].get("net_saved_usd") is not None]
+    net = sum(r["cost"]["net_saved_usd"] for r in priced)
+    n = len(rows)
+    idle = [r for r in rows if r["x"].get("idle_signature")]
+
+    head = (f"**Across {n} compaction{'s' if n != 1 else ''}, the agent kept {tot['kept']} of the {tot['items']} things "
+            f"that mattered, blurred {tot['distorted']} and lost {tot['lost']}, and the compactions saved about "
+            f"${net:.0f} of API-priced work on what followed. "
+            f"{NUM_WORDS[critical] if critical < len(NUM_WORDS) else critical} of the {missing} blurred or lost items "
+            "would have led to a wrong action.**")
+    L = ["# What your compactions gave up and what they saved", "",
+         f"*Generated {dt.date.today().isoformat()} from the compaction log. Length limit: {OVERVIEW_WORD_LIMIT} words at five "
+         f"compactions, one more table row for each further one, and at most {OVERVIEW_CRITICAL_SHOWN} critical items listed.*",
+         "", head, ""]
+    kind = ("All are idle compactions" if len(idle) == n else f"{len(idle)} of the {n} are idle compactions")
+    L += [f"{kind}: Claude Code compacted a long session while you were away from it. The log does not record a setting "
+          "being varied between them, so none shows which setting is better.", ""]
+
+    L += ["## The five compactions" if n == 5 else "## The compactions", "",
+          "| Session | History removed (tokens) | Kept | Score | Critical | Net saved | First reply, with / without |",
+          "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        c, x = r["cost"], r["x"]
+        have = c and c.get("calls")
+        L.append(f"| {r['name']} | {c['history_removed_tokens']:,} | " if have else f"| {r['name']} | not available | ")
+        L[-1] += (f"{r['tot']['kept']} of {r['tot']['items']} | {x.get('retention_pct'):g}% | {x.get('critical_losses')} | "
+                  + (f"${c['net_saved_usd']:.2f} | ${c['first_reply_usd_with']:.2f} / ${c['first_reply_usd_without']:.2f} |"
+                     if have and c.get("net_saved_usd") is not None else "not available | not available |"))
+    L += ["", "*Score* counts important items more. *Critical* means forgetting it causes a wrong action. *Net saved* is the "
+          "extra cost of the later calls with the full history, minus an estimate of what writing the summary cost.", ""]
+
+    kinds = {}
+    for r in rows:
+        for cat, c in r["cats"].items():
+            d = kinds.setdefault(cat, {"items": 0, "kept": 0})
+            d["items"] += c.get("items", 0)
+            d["kept"] += c.get("kept", 0)
+    ordered = sorted(kinds.items(), key=lambda kv: (-kv[1]["kept"] / max(kv[1]["items"], 1), kv[0]))
+    label = lambda cat: KIND_LABELS.get(cat, cat.replace("_", " ").capitalize())
+    L += ["## What survives, by kind", "", "| Kind | Kept |", "|---|---|"]
+    L += [f"| {label(cat)} | {c['kept']} of {c['items']} ({100 * c['kept'] / max(c['items'], 1):.0f}%) |" for cat, c in ordered]
+    best = [label(cat) for cat, c in ordered if c["kept"] == c["items"]]
+    worst = label(ordered[-1][0])
+    note = (f"{' and '.join(best)} survived every time. " if best else "")
+    if len(ordered) > 1:
+        note += f"{worst} fared worst."
+    L += ["", note.strip(), ""]
+
+    crit_items = []
+    for r in rows:
+        try:
+            items = json.loads((Path(r["x"]["run_dir"]) / "probe_scores.json").read_text())["items"]
+        except (OSError, ValueError, KeyError):
+            continue
+        for it in items:
+            if it["status"] == "scored" and it["severity"] == 2 and it["summary"] != "kept":
+                crit_items.append((r["name"], it["summary"], it["question"]))
+    word = {"lost": "lost", "distorted": "blurred"}
+    L += ["## The four critical items" if len(crit_items) == 4 else "## The critical items", ""]
+    L += [f"- **{name}** {word.get(g, g)} the answer to: {q}" for name, g, q in crit_items[:OVERVIEW_CRITICAL_SHOWN]]
+    if len(crit_items) > OVERVIEW_CRITICAL_SHOWN:
+        L.append(f"- And {len(crit_items) - OVERVIEW_CRITICAL_SHOWN} more, in each run's report.")
+    if not crit_items:
+        L.append("None.")
+    L.append("")
+
+    runs = {}
+    replays = []
+    incidents = {"n": 0, "of": 0}
+    for r in rows:
+        x = r["x"]
+        if x.get("divergence_mean") is not None and x.get("noise_floor") is not None:
+            replays.append((x["divergence_mean"], x["noise_floor"]))
+        try:
+            run_json = json.loads((Path(x["run_dir"]) / "run.json").read_text())
+            if run_json.get("incidents"):
+                incidents["n"] += run_json["incidents"]["incidents"]
+                incidents["of"] += run_json["incidents"]["messages"]
+        except (OSError, ValueError, KeyError):
+            pass
+    L += ["## How the agent behaved afterwards", ""]
+    sentence = []
+    if replays:
+        above = sum(1 for d, nf in replays if d > nf)
+        prefix = (f"On the {len(replays)} compactions with a replay, the compacted agent differed" if above == len(replays)
+                  else f"On {above} of the {len(replays)} compactions with a replay, the compacted agent differed")
+        sentence.append(f"{prefix} from the full-history agent more than two runs of the same agent differ "
+                        f"({min(d for d, _ in replays):.1f} to {max(d for d, _ in replays):.1f} on a 0 to 3 scale, against "
+                        f"{min(nf for _, nf in replays):g} to {max(nf for _, nf in replays):.1f}).")
+    if incidents["of"]:
+        sentence.append(f"{incidents['n']} later message{'s' if incidents['n'] != 1 else ''} of {incidents['of']} "
+                        "had to restate something.")
+    L += [" ".join(sentence) or "No replay or later messages were judged.", ""]
+
+    L += ["## What this means for each setting", ""]
+    pidle = [r for r in idle if r in priced]
+    if pidle:
+        gains = [r["cost"]["first_reply_usd_without"] - r["cost"]["first_reply_usd_with"] for r in pidle]
+        nets = [r["cost"]["net_saved_usd"] for r in pidle]
+        L += [f"**`idleCompaction`** (compact a long session after a break). The gain: ${min(gains):.2f} to ${max(gains):.2f} "
+              f"less on the first reply back, and ${min(nets):.2f} to ${max(nets):.2f} net over what followed. The price: "
+              f"about {100 * missing / max(tot['items'], 1):.0f}% of the items blurred or lost ({missing} of {tot['items']}). "
+              "Turning it off keeps the full history after a break, at the \"without\" column's price. Nothing here shows the "
+              "full-history session would have gone better.", ""]
+    else:
+        L += ["**`idleCompaction`** (compact a long session after a break). No idle compaction is priced here.", ""]
+    if idle:
+        L += [f"**`CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`** (the size from which idle compaction runs). All {len(idle)} idle "
+              f"compactions were at {min(r['x'].get('preTokens') or 0 for r in idle):,} tokens or more, so this says nothing "
+              "about smaller sessions.", ""]
+    size = [r for r in rows if not r["x"].get("idle_signature") and r["x"].get("trigger") == "auto"]
+    if size:
+        pts = [r["x"].get("preTokens") or 0 for r in size]
+        L += [f"**`autoCompactWindow`** (how large a session grows before compacting for size). {len(size)} of the {n} compacted "
+              f"for size, at {min(pts):,} to {max(pts):,} tokens; the log does not compare windows.", ""]
+    else:
+        L += [f"**`autoCompactWindow`** (how large a session grows before compacting for size). None of the {n} compacted for "
+              "size, so there is no evidence here.", ""]
+
+    no_at = sum(1 for x in lines if "at_compaction" not in x)
+    L += ["## What the data cannot support", "",
+          "- **Which setting to choose.** Nothing was compared under two settings.",
+          "- **Other kinds of compaction.** Only idle ones were scored." if len(idle) == n else
+          f"- **Other kinds of compaction.** {n - len(idle)} of the {n} are not idle; too few to compare the kinds.",
+          "- **The summary alone.** Each score counts everything the agent had: the summary, and the messages and files "
+          "Claude Code kept beside it.",
+          (f"- **Whether a loss cost anything in practice.** Apart from those {incidents['of']} messages, the eval does not "
+           "follow what the session did next." if incidents["of"] else
+           "- **Whether a loss cost anything in practice.** The eval does not follow what the session did next."),
+          f"- **Precise percentages.** One user, {n} compaction{'s' if n != 1 else ''}, {tot['items']} items, one extraction "
+          "choosing the questions, one judge grading once. A kind with few items moves several points on one item.",
+          "- **The dollar figures as bills.** They are estimates at API list prices, on the calls that really happened. A session "
+          "keeping its full history might have gone differently, and would have reached its auto-compact limit and compacted "
+          "anyway. On a subscription nothing is billed per call.",
+          "- **The settings written in the log.** They were read when each eval ran, not when the compaction ran"
+          + (f"; {no_at} of the {len(lines)} log lines have nothing else, so their settings may be wrong for the compaction." if no_at
+             else "; each line also records what its transcript proves."), ""]
+
+    if left_out:
+        L += ["## Compactions left out", ""] + [f"- {name}: {why}." for name, why in left_out] + [""]
+
+    tests = [x for x in lines if is_self_test(x)]
+    bar = cfg["self_test_max_retention_pct"]
+    fair = [x for x in tests if self_test_reading(x, bar) == "passed"]
+    failed = [x for x in tests if self_test_reading(x, bar) == "failed"]
+    older = len(tests) - len(fair) - len(failed)
+    reals = [x for x in lines if not is_self_test(x)]
+    rng = (f", between {min(x['retention_pct'] for x in fair):g}% and {max(x['retention_pct'] for x in fair):g}%"
+           if fair else "")
+    L += [f"## The {len(lines)} runs behind this", "",
+          f"{len(reals)} real scores ({n} shown here, the other {len(reals) - n} superseded or not validated) and {len(tests)} "
+          f"self-tests. Of those self-tests, {len(fair)} are fair passes{rng}, and each of the {n} scores rests on one. "
+          f"{len(failed)} failed and {older} date from before the test was fair; they do not count."]
+    return "\n".join(L) + "\n"
+
+
+def cmd_overview(args, cfg):
+    """Plain-language report across every compaction logged so far. Spends nothing."""
+    _, lines = load_log(cfg, args.results_dir)
+    text = build_overview(lines, cfg)
+    if args.out:
+        Path(args.out).write_text(text)
+        print(f"Overview written to {args.out} ({len(text.split())} words).")
+    else:
+        print(text, end="")
 
 
 def cmd_check_pricing(args, cfg):
@@ -792,7 +1698,23 @@ def cmd_run(args, cfg):
     judge = judge_model(cfg, sess_model)
     override = Path(args.summary_override).read_text() if args.summary_override else None
     label = args.label or ("planted" if override is not None else "real")
+    strip = override is not None and not args.keep_reattached
     do_cf = args.counterfactual == "yes"
+    if strip and do_cf:
+        sys.exit("The self-test scrubs the user's message that turn 1 replies to, so it runs the probe only: "
+                 "use --counterfactual no.")
+    validated_by = None
+    if override is None:
+        # A real score is trusted only once a gutted summary has scored low on the same compaction.
+        _, logged = load_log(cfg, args.results_dir)
+        passes = fair_passes(logged, cfg["self_test_max_retention_pct"], path.stem, a["boundary_line"])
+        if passes:
+            validated_by = passes[-1].get("run_dir")
+        elif not args.unvalidated:
+            sys.exit(f"No fair self-test has passed on this compaction ({path.stem[:8]}, line "
+                     f"{a['boundary_line']}), so its real score could not be trusted. Run the self-test first "
+                     "(plant --mode gut, then run --summary-override <file> --counterfactual no), then this "
+                     "run with --reuse <the self-test's folder>. --unvalidated runs anyway; the log marks it.")
     n_turns = min(args.turns or cfg["turns"], len(a["turns"])) if do_cf else 0
     noise_mode = args.noise or cfg["noise"]
     rng = random.Random(args.seed)
@@ -811,7 +1733,12 @@ def cmd_run(args, cfg):
            "extractor_model": cfg["extractor_model"], "extractor_effort": cfg["extractor_effort"],
            "judge_model": judge, "judge_effort": cfg["judge_effort"],
            "replay_claude_code_version": claude_version(cfg), "settings": settings_in_force(),
-           "reuse": args.reuse, "estimate": est, "copies": []}
+           "at_compaction": at_compaction(t, a), "cost_side": cost_side(t, a, prices),
+           "reuse": args.reuse, "estimate": est, "copies": [],
+           "reattached": [{k: r[k] for k in ("line", "file", "chars")} for r in a["reattached"]],
+           "kept": [{k: r[k] for k in ("line", "type", "chars")} for r in a["kept"]],
+           "session_attachments": [{k: r[k] for k in ("line", "type")} for r in a["session_attachments"]],
+           "reattached_stripped": strip, "validated_by": validated_by}
     write_json(run_dir / "run.json", run)
     print(f"Run folder: {run_dir}")
 
@@ -822,14 +1749,37 @@ def cmd_run(args, cfg):
     full_sid = sum_sid = None
     try:
         if not args.reuse or n_turns:
-            full_sid, p = make_copy(cfg, t, a["bi"] - 1, splice=splice, reparent_to=a["pre_leaf_uuid"])
+            full_sid, p, _, _ = make_copy(cfg, t, a["bi"] - 1, splice=splice, reparent_to=a["pre_leaf_uuid"])
             run["copies"].append(p)
         cuts = [t.by[x["summary_cut"]] for x in (need or a["turns"][:1])]
         sum_upto = max(cuts + [a["summary_idx"] or 0])
-        sum_sid, p = make_copy(cfg, t, sum_upto, summary_idx=a["summary_idx"], override=override)
+        # Self-test: every route by which the session's own content reaches the summary side is scrubbed,
+        # not only the summary: the kept messages, and every non-generic attachment up to the cut.
+        to_scrub = self_test_scope(t, a)[2] if strip else []
+        sum_sid, p, n_scrubbed, removed = make_copy(cfg, t, sum_upto, summary_idx=a["summary_idx"],
+                                                    override=override, scrub=to_scrub)
         run["copies"].append(p)
+        run["scrubbed"] = [{"line": t.lineno[i], "type": t.recs[i].get("type"),
+                            "attachment": (t.recs[i].get("attachment") or {}).get("type")} for i in to_scrub]
+        run["reattached_blanked"] = n_scrubbed
+        if strip and n_scrubbed != len(to_scrub):
+            sys.exit(f"Self-test: scrubbed {n_scrubbed} of {len(to_scrub)} records; a record held no text "
+                     "where scrub_record looks, so the format may have changed and the self-test would not "
+                     "be a fair control. Fix scrub_record first.")
         write_json(run_dir / "run.json", run)
         sum_cut1 = a["turns"][0]["summary_cut"] if a["turns"] else t.recs[sum_upto]["uuid"]
+
+        # The free leak check, before anything is spent. Claude Code builds the summary-side request three
+        # times and a local catcher keeps it: from a copy that is NOT scrubbed (the positive control: the
+        # removed text must be found there), from the scrubbed copy (it must be gone), and with no session
+        # (text the setup itself carries, which is not a leak).
+        if strip:
+            check, req_sum, req_null = leak_check(cfg, t, a, sum_upto, sum_cut1, override, sum_sid, removed,
+                                                  sess_model, run["copies"])
+            run["leak_check"] = check
+            write_json(run_dir / "run.json", run)
+            if check["verdict"] != "clean":
+                sys.exit(f"Leak check: {check['verdict']}. Nothing was spent.")
 
         # Station 1: probe.
         print("Probe")
@@ -848,6 +1798,13 @@ def cmd_run(args, cfg):
             answers = {"full": ask_answers(call, "probe_full", items, sess_model, sess_effort,
                                            session=full_sid, cut=a["pre_leaf_uuid"])}
         write_json(run_dir / "items.json", items)
+        if strip:
+            # A literal answer still in the scrubbed request is a route the scrub does not cover: it is
+            # reported, and it fails the verdict when the item is scored.
+            reach = answers_reachable(items, req_sum, req_null)
+            run["leak_check"]["answers_reachable"] = reach
+            write_json(run_dir / "run.json", run)
+            print(f"  item answers still in the scrubbed request: {', '.join(reach) or 'none'}")
 
         # Counterfactual, full side, while the full copy is warm in the cache.
         replies = {}
@@ -938,7 +1895,27 @@ def cmd_run(args, cfg):
         "divergence_minus_noise": round(mean_gap - noise_floor, 2) if mean_gap is not None and noise_floor is not None else None,
         "turns_scored": len(cf), "incident_rate": incidents["rate"] if incidents else None,
     }
+    self_test = None
+    if label == "planted":
+        r, n = probe["retention_pct"], probe["items_scored"]
+        reasons = []
+        if not strip:
+            reasons.append("the session's other routes were kept (--keep-reattached), so this is not the fair control")
+        reach = (run.get("leak_check") or {}).get("answers_reachable") or []
+        scored_ids = {x["id"] for x in rows if x["status"] == "scored"}
+        if strip and set(reach) & scored_ids:
+            reasons.append("answers of scored items still reach the summary side by another route: "
+                           + ", ".join(sorted(set(reach) & scored_ids)))
+        if n < cfg["self_test_min_items"]:
+            reasons.append(f"only {n} scored items (minimum {cfg['self_test_min_items']})")
+        if r is None or r > cfg["self_test_max_retention_pct"]:
+            reasons.append(f"retention {r}% is above {cfg['self_test_max_retention_pct']}%")
+        self_test = {"passed": not reasons, "retention_pct": r, "items_scored": n,
+                     "max_retention_pct": cfg["self_test_max_retention_pct"],
+                     "reattached_stripped": strip, "records_scrubbed": run.get("reattached_blanked"),
+                     "leak_check": run.get("leak_check"), "reasons": reasons}
     run.update({"finished": now_iso(), "headline": headline, "probe": probe, "counterfactual": cf,
+                "self_test": self_test,
                 "incidents": incidents, "note": note, "calls": call.ledger,
                 "cost": {"estimate_usd": est["total_usd"], "actual_usd_table": actual_usd,
                          "actual_usd_claude_code": round(sum(c["cost_usd_claude_code"] or 0 for c in call.ledger), 4),
@@ -954,16 +1931,26 @@ def cmd_run(args, cfg):
         "context_before_tokens": f["context_before_tokens"], "context_after_tokens": f["context_after_tokens"],
         "session_model": f["session_model"], "session_effort": f["session_effort"],
         "claude_code_version": f["claude_code_version"], "replay_claude_code_version": run["replay_claude_code_version"],
-        "settings": run["settings"], "extractor_model": cfg["extractor_model"], "judge_model": judge,
+        "settings": run["settings"], "at_compaction": run["at_compaction"], "cost_side": run["cost_side"],
+        "extractor_model": cfg["extractor_model"], "judge_model": judge,
         **headline, "by_category": probe["by_category"],
         "cost_estimate_usd": est["total_usd"], "cost_actual_usd": actual_usd, "tokens": tokens,
         "prices_taken": prices["taken"], "run_dir": str(run_dir),
+        "reattached_files": f["reattached_files"], "reattached_stripped": strip,
+        "kept_messages": f["kept_messages"], "kept_reply_chars": f["kept_reply_chars"],
+        "records_scrubbed": run.get("reattached_blanked") if strip else 0,
     }
+    if override is None:
+        log_line["validated_by"] = validated_by
+    if self_test is not None:
+        log_line["self_test_passed"] = self_test["passed"]
     log = Path(args.results_dir or cfg["results_dir"]) / "log.jsonl"
     with open(log, "a") as fh:
         fh.write(json.dumps(log_line, ensure_ascii=False) + "\n")
     print(f"\nReport: {run_dir / 'report.md'}\nLog: {log}")
     print(json.dumps(headline, indent=2))
+    if self_test is not None:
+        print("Self-test: " + ("PASSED" if self_test["passed"] else "FAILED: " + "; ".join(self_test["reasons"])))
 
 
 def write_report(run_dir, run, rows):
@@ -972,8 +1959,42 @@ def write_report(run_dir, run, rows):
     L += [f"Run {run['started']}. Transcript `{run['transcript']}`, {run['lines_read']} lines read "
           f"(md5 {run['md5_read']}).", ""]
     if run["summary_override"]:
-        L += [f"**Self-test run:** the summary was replaced by `{run['summary_override']}`. "
-              "This score is expected to be low.", ""]
+        st = run.get("self_test") or {}
+        blanked = (f"{run.get('reattached_blanked')} records of the session's other routes scrubbed: kept "
+                   "messages, re-attached files, file notes, invoked skills" if run.get("reattached_stripped")
+                   else "the other routes kept, so this is not the fair control")
+        L += [f"**Self-test run:** the summary was replaced by `{run['summary_override']}` ({blanked}). "
+              f"Verdict: **{'PASSED' if st.get('passed') else 'FAILED'}**"
+              + (f" ({'; '.join(st.get('reasons', []))})" if st.get("reasons") else "")
+              + f". It passes at {st.get('max_retention_pct')}% retention or below.", ""]
+        lc = run.get("leak_check")
+        if lc:
+            L += [f"**Leak check (free):** {lc['canaries']} distinctive lines removed; found in the request built "
+                  f"from the unscrubbed copy: {lc['found_unscrubbed']} (the control); in the scrubbed request: "
+                  f"{lc['found_scrubbed']}. Item answers still reachable: "
+                  f"{', '.join(lc.get('answers_reachable') or []) or 'none'}.", ""]
+    if not run["summary_override"]:
+        L += [(f"**Validated:** a fair self-test passed on this compaction (`{Path(run['validated_by']).name}`)."
+               if run.get("validated_by") else "**Not validated:** no fair self-test had passed on this "
+               "compaction when this run was made, so its score is not trusted."), ""]
+    if run.get("kept"):
+        reply = sum(k["chars"] for k in run["kept"] if k["type"] == "assistant")
+        L += [f"**Kept messages:** Claude Code kept {len(run['kept'])} record(s) from before the compaction word "
+              f"for word after the summary, among them the agent's last reply ({reply} characters). "
+              + ("They were scrubbed for this self-test." if run.get("reattached_stripped") else
+                 "The compacted agent had them, so retention counts what they carry, not only the summary's."), ""]
+    if run.get("reattached"):
+        L += [f"**Re-attached files:** Claude Code re-attached {len(run['reattached'])} file(s) after the "
+              "compaction. " + ("They were blanked for this self-test." if run.get("reattached_stripped") else
+                                "The compacted agent had them, so retention counts facts they carry, not only "
+                                "the summary's.")]
+        L += [f"- line {r['line']}: `{r['file']}` ({r['chars']} characters)" for r in run["reattached"]]
+        L += [""]
+    if run.get("cost_side"):
+        L += ["## What this compaction lost, and what it saved", "",
+              f"**Lost:** retention {h['retention_pct']}% of {h['items_scored']} scored items, "
+              f"{h['critical_losses']} critical loss(es).", "",
+              "**Saved:** " + " ".join(cost_lines(run["cost_side"])), ""]
     L += ["## Headline", "", "| Measure | Value |", "|---|---|",
           f"| Weighted retention | {h['retention_pct']}% of {h['items_scored']} scored items "
           f"({h['items_extracted']} extracted) |",
@@ -1016,7 +2037,9 @@ def write_report(run_dir, run, rows):
     L += ["", "## Settings", "", f"Answering agents: {run['answer_model']} ({run['answer_effort']}). "
           f"Extractor: {run['extractor_model']} ({run['extractor_effort']}). Judge: {run['judge_model']} "
           f"({run['judge_effort']}). Replay on {run['replay_claude_code_version']}; the session ran on "
-          f"{f['claude_code_version']}.", "", f"Settings at run time: `{json.dumps(run['settings'])}`"]
+          f"{f['claude_code_version']}.", "",
+          f"Known from the transcript about this compaction: `{json.dumps(run.get('at_compaction'))}`", "",
+          f"Settings file when the eval ran (it may differ from the compaction's): `{json.dumps(run['settings'])}`"]
     (Path(run_dir) / "report.md").write_text("\n".join(L) + "\n")
 
 
@@ -1050,6 +2073,28 @@ def main():
     p.add_argument("--keep-copies", action="store_true")
     p.add_argument("--force", action="store_true", help="run even if the summary gate fails")
     p.add_argument("--reuse-incidents-skip", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--unvalidated", action="store_true",
+                   help="real run without a fair self-test on this compaction; the log and report mark it")
+    p.add_argument("--keep-reattached", action="store_true",
+                   help="self-test only: keep the session's other routes (kept messages, re-attached files, "
+                        "file notes, invoked skills); not the fair control, never passes")
+    p = sub.add_parser("leak-check", help="free: would a gutted self-test still let session content through?")
+    target(p)
+    p.add_argument("--summary-override", help="planted summary (default: the gutted one)")
+    p.add_argument("--items", help="items.json of an earlier run: also list answers still reachable")
+    p.add_argument("--answer-model")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("self-test-status", help="has a fair self-test passed on this compaction? exit 0 if yes")
+    target(p)
+    p.add_argument("--results-dir")
+    p = sub.add_parser("history", help="every logged run, with what each result can be trusted for today")
+    p.add_argument("--results-dir")
+    p = sub.add_parser("tradeoff", help="free: one compaction, what it lost beside what it saved")
+    target(p)
+    p.add_argument("--results-dir")
+    p = sub.add_parser("overview", help="free: a plain-language report across every logged compaction")
+    p.add_argument("--results-dir")
+    p.add_argument("--out", help="write the report to this file instead of printing it")
     p = sub.add_parser("plant", help="write a damaged copy of the summary for the self-test")
     target(p)
     p.add_argument("--mode", choices=["gut", "drop"], default="gut")
@@ -1060,7 +2105,8 @@ def main():
     args = ap.parse_args()
     cfg = load_config(args.config)
     {"list": cmd_list, "plan": cmd_plan, "run": cmd_run, "plant": cmd_plant,
-     "check-pricing": cmd_check_pricing}[args.cmd](args, cfg)
+     "check-pricing": cmd_check_pricing, "self-test-status": cmd_self_test_status,
+     "leak-check": cmd_leak_check, "history": cmd_history, "tradeoff": cmd_tradeoff, "overview": cmd_overview}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":
