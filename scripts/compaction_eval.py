@@ -49,6 +49,9 @@ DEFAULTS = {
     # 10 fails all five and leaves room for a stray item or two. Recalibrate as runs accumulate.
     "self_test_max_retention_pct": 10,
     "self_test_min_items": 10,               # fewer scored items: the verdict is not trusted
+    # A full-history call this much smaller than the session was not full: the copy compacted when reopened.
+    # Measured 2026-11-09 on all 33 logged runs: 0.798 and above on every healthy call, 0.055 on the one that did.
+    "full_side_min_context_ratio": 0.5,
     "kept_reply_warn_chars": 1000,           # plan warns when the reply kept after the summary is longer
     "replay_short_chars": 40,                # plan warns when the replay is one message at most this long
     "capture_timeout_s": 180,                # the free request capture of the self-test's leak check
@@ -663,6 +666,11 @@ def leak_check(cfg, t, a, sum_upto, cut, override, scrubbed_sid, removed, model,
     which is not a leak). Appends the extra copy's path to `copies` so the caller deletes it.
     Returns (check, scrubbed request text, no-session request text)."""
     print("Leak check (free: the requests are caught locally, nothing is sent)")
+    # Signed out, Claude Code stops before building any request, and the check below could only say "did not
+    # build one of the requests", which hides the cause (2026-11-16: an expired OAuth session cost a night's queue).
+    if signed_out(cfg):
+        return ({"verdict": "the command-line claude is signed out, so Claude Code builds no request: run "
+                            "`claude auth login` in a terminal, then rerun"}, None, None)
     cans = canaries(removed)
     raw_sid, raw_p, _, _ = make_copy(cfg, t, sum_upto, summary_idx=a["summary_idx"], override=override)
     copies.append(raw_p)
@@ -704,12 +712,21 @@ def leak_check(cfg, t, a, sum_upto, cut, override, scrubbed_sid, removed, model,
     return check, req_sum, req_null
 
 
-def answers_reachable(items, req_sum, req_null):
+def working_folders(t, upto):
+    """The working folders recorded in a copy's records. Claude Code lists them as setup, whatever the summary says."""
+    return sorted({t.recs[i]["cwd"] for i in range(upto + 1) if t.recs[i].get("cwd")})
+
+
+def answers_reachable(items, req_sum, req_null, working_folders=()):
     """Items whose literal answer (a path, an id, a number) is in the scrubbed request and not in the
-    no-session one: a route the scrub does not cover."""
+    no-session one: a route the scrub does not cover. A working folder standing as a whole path is setup,
+    not a route: on 2026-11-08 it failed two self-tests that scored 3.7% and 0.0%. A folder inside a longer
+    path still counts, and an answer the agent really gives from the listing still scores in the retention."""
     home = str(Path.home())
     s_low = req_sum.replace(home, "~").lower()
     n_low = req_null.replace(home, "~").lower()
+    for w in sorted({str(w).replace(home, "~").lower() for w in working_folders}, key=len, reverse=True):
+        s_low = re.sub(re.escape(w) + r"(?![\w./@-])", " ", s_low)
     return [it["id"] for it in items if literals(it["answer"]) and
             all(x.lower() in s_low for x in literals(it["answer"])) and
             not all(x.lower() in n_low for x in literals(it["answer"]))]
@@ -728,6 +745,17 @@ def canaries(strings):
             if ln not in out and SCRUBBED not in ln:
                 out.append(ln)
     return out
+
+
+def signed_out(cfg):
+    """True only when `claude auth status` answers loggedIn false. An answer that cannot be read is no verdict:
+    the check goes on, and its own control still catches a request that was not built."""
+    try:
+        out = subprocess.run([cfg["claude_bin"], "auth", "status"], capture_output=True, text=True,
+                             timeout=60).stdout
+        return json.loads(out).get("loggedIn") is False
+    except Exception:
+        return False
 
 
 def claude_version(cfg):
@@ -1277,7 +1305,7 @@ def cmd_leak_check(args, cfg):
         check, req_sum, req_null = leak_check(cfg, t, a, sum_upto, cut, override, sid, removed, model, copies)
         if args.items and req_sum and req_null:
             items = json.loads(Path(args.items).read_text())
-            check["answers_reachable"] = answers_reachable(items, req_sum, req_null)
+            check["answers_reachable"] = answers_reachable(items, req_sum, req_null, working_folders(t, sum_upto))
             print(f"  item answers still in the scrubbed request: {', '.join(check['answers_reachable']) or 'none'}")
     finally:
         for p in copies:
@@ -1296,6 +1324,19 @@ def load_log(cfg, results_dir=None):
     log = Path(results_dir or cfg["results_dir"]).expanduser() / "log.jsonl"
     lines = [json.loads(x) for x in log.read_text().splitlines() if x.strip()] if log.exists() else []
     return log, lines
+
+
+def compacted_full_calls(calls, context_before, min_ratio):
+    """The full-side calls whose context is far smaller than the session's, so they did not have its full history.
+    Returns [{label, context}]. A call that reports no usage (a failed call) says nothing about its size."""
+    out = []
+    for c in calls or []:
+        u = c.get("usage") or {}
+        ctx = sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        if (re.match(r"(extract|probe_full|cf\d+_full(_noise)?)$", c.get("label", "")) and ctx and context_before
+                and ctx < min_ratio * context_before):
+            out.append({"label": c["label"], "context": ctx})
+    return out
 
 
 def is_self_test(x):
@@ -1432,9 +1473,16 @@ def cmd_history(args, cfg):
                 reading = real_reading(x, passes)
             notes = []
             try:
-                cost = json.loads((Path(x.get("run_dir", "")) / "run.json").read_text()).get("cost") or {}
+                saved = json.loads((Path(x.get("run_dir", "")) / "run.json").read_text())
+                cost = saved.get("cost") or {}
                 cc, tb = cost.get("actual_usd_claude_code"), cost.get("actual_usd_table")
-                if cc and tb and abs(cc - tb) > max(0.05, 0.02 * tb):
+                before = x.get("context_before_tokens") or x.get("preTokens")
+                shrunk = compacted_full_calls(saved.get("calls"), before, cfg["full_side_min_context_ratio"])
+                if shrunk:
+                    notes.append(f"its full side was not full: {shrunk[0]['label']} carried {shrunk[0]['context']:,} tokens "
+                                 f"where the session had {before:,}, so the copy compacted when reopened and its cost "
+                                 f"figures (${cc} Claude Code, ${tb} price table) do not describe a full-history call")
+                elif cc and tb and abs(cc - tb) > max(0.05, 0.02 * tb):
                     notes.append(f"its report's Claude Code cost figure ${cc} is wrong; the price-table "
                                  f"figure ${tb} is right")
             except (OSError, ValueError):
@@ -1483,7 +1531,15 @@ def cmd_tradeoff(args, cfg):
 
 
 NUM_WORDS = ["None", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve"]
-ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
+ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+            "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth",
+            "eighteenth", "nineteenth", "twentieth"]
+
+
+def compaction_label(i):
+    """The name suffix for a session's compaction i (0-based, in transcript order). Past the twentieth it is a
+    number: "later" for all of them made compactions 9 to 12 of one session read as one row four times (2026-11-17)."""
+    return f"{ORDINALS[i]} compaction" if i < len(ORDINALS) else f"compaction {i + 1}"
 KIND_LABELS = {"ruling": "Rulings", "decision": "Decisions", "id_path": "Exact ids and paths",
                "constraint": "Constraints", "open_task": "Open tasks", "fact": "Facts"}
 OVERVIEW_WORD_LIMIT = 900        # at five compactions; each further one adds a table row
@@ -1536,10 +1592,11 @@ def overview_rows(lines, cfg):
     for r in rows:
         per_session.setdefault(r["sid"], []).append(r)
     for r in rows:
-        same = per_session[r["sid"]]
+        # Ordinals follow the compactions' order in the transcript, not the order they were scored in.
+        same = sorted(per_session[r["sid"]], key=lambda s: s["line"] or 0)
         r["name"] = plain_name(r["sid"])
         if len(same) > 1:
-            r["name"] += f", {ORDINALS[same.index(r)] if same.index(r) < len(ORDINALS) else 'later'} compaction"
+            r["name"] += f", {compaction_label(same.index(r))}"
     return rows, left_out
 
 
@@ -1901,7 +1958,7 @@ def cmd_run(args, cfg):
         if strip:
             # A literal answer still in the scrubbed request is a route the scrub does not cover: it is
             # reported, and it fails the verdict when the item is scored.
-            reach = answers_reachable(items, req_sum, req_null)
+            reach = answers_reachable(items, req_sum, req_null, working_folders(t, sum_upto))
             run["leak_check"]["answers_reachable"] = reach
             write_json(run_dir / "run.json", run)
             print(f"  item answers still in the scrubbed request: {', '.join(reach) or 'none'}")
@@ -1995,12 +2052,26 @@ def cmd_run(args, cfg):
         "divergence_minus_noise": round(mean_gap - noise_floor, 2) if mean_gap is not None and noise_floor is not None else None,
         "turns_scored": len(cf), "incident_rate": incidents["rate"] if incidents else None,
     }
+    full_compacted = compacted_full_calls(call.ledger, f["context_before_tokens"] or f["preTokens"],
+                                          cfg["full_side_min_context_ratio"])
+    if full_compacted:
+        print(f"  ! The full side was not full: {full_compacted[0]['label']} carried {full_compacted[0]['context']:,} "
+              f"tokens where the session had {f['context_before_tokens'] or f['preTokens']:,}.")
     self_test = None
     if label == "planted":
         r, n = probe["retention_pct"], probe["items_scored"]
         reasons = []
         if not strip:
             reasons.append("the session's other routes were kept (--keep-reattached), so this is not the fair control")
+        # A failed or unreadable call leaves answers empty, and an empty answer scores 0%: the score a pass needs.
+        failed = [c["label"] for c in call.ledger if c["is_error"]]
+        if failed:
+            reasons.append("model calls failed, so the score cannot be trusted: " + ", ".join(failed))
+        if not answers.get("summary") and "probe_summary" not in failed:
+            reasons.append("the summary-side answers could not be read, so the score cannot be trusted")
+        if full_compacted:
+            reasons.append("the full side compacted when reopened, so it did not have the session's history: "
+                           + ", ".join(c["label"] for c in full_compacted))
         reach = (run.get("leak_check") or {}).get("answers_reachable") or []
         scored_ids = {x["id"] for x in rows if x["status"] == "scored"}
         if strip and set(reach) & scored_ids:
@@ -2015,7 +2086,7 @@ def cmd_run(args, cfg):
                      "reattached_stripped": strip, "records_scrubbed": run.get("reattached_blanked"),
                      "leak_check": run.get("leak_check"), "reasons": reasons}
     run.update({"finished": now_iso(), "headline": headline, "probe": probe, "counterfactual": cf,
-                "self_test": self_test,
+                "self_test": self_test, "full_side_compacted": full_compacted,
                 "incidents": incidents, "note": note, "calls": call.ledger,
                 "cost": {"estimate_usd": est["total_usd"], "actual_usd_table": actual_usd,
                          "actual_usd_claude_code": round(sum(c["cost_usd_claude_code"] or 0 for c in call.ledger), 4),
@@ -2040,6 +2111,7 @@ def cmd_run(args, cfg):
         "reattached_files": f["reattached_files"], "reattached_stripped": strip,
         "kept_messages": f["kept_messages"], "kept_reply_chars": f["kept_reply_chars"],
         "records_scrubbed": run.get("reattached_blanked") if strip else 0,
+        "full_side_compacted": bool(full_compacted),
     }
     if override is None:
         log_line["validated_by"] = validated_by
@@ -2078,6 +2150,11 @@ def write_report(run_dir, run, rows):
         L += [(f"**Validated:** a fair self-test passed on this compaction (`{Path(run['validated_by']).name}`)."
                if run.get("validated_by") else "**Not validated:** no fair self-test had passed on this "
                "compaction when this run was made, so its score is not trusted."), ""]
+    if run.get("full_side_compacted"):
+        L += [f"**Full side not full:** {run['full_side_compacted'][0]['label']} carried "
+              f"{run['full_side_compacted'][0]['context']:,} tokens where the session had "
+              f"{f['context_before_tokens'] or f['preTokens']:,}. The copy compacted when reopened, so what the "
+              "full-history agent answered or replied does not reflect the session's history.", ""]
     if run.get("kept"):
         reply = sum(k["chars"] for k in run["kept"] if k["type"] == "assistant")
         L += [f"**Kept messages:** Claude Code kept {len(run['kept'])} record(s) from before the compaction word "
